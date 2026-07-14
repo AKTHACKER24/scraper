@@ -467,6 +467,75 @@ def create_tables_if_needed():
         FOREIGN KEY (competitor_id) REFERENCES competitors (competitor_id)
     ) ENGINE=InnoDB;
 
+    CREATE TABLE IF NOT EXISTS google_shopping_results_temp (
+        result_id       BIGINT AUTO_INCREMENT PRIMARY KEY,
+        product_id      INT,
+        google_title        VARCHAR(512),
+        google_description  TEXT,
+        gs_main_image   VARCHAR(1024),
+        gs_images       JSON,
+        brand           VARCHAR(128),
+        color           TEXT,
+        width           DECIMAL(8,2),
+        height          DECIMAL(8,2),
+        depth           DECIMAL(8,2),
+        style           VARCHAR(256),
+        material        VARCHAR(256),
+        shape           VARCHAR(128),
+        assembly_required   BOOLEAN,
+        weight          DECIMAL(8,2),
+        rating_star     DECIMAL(3,2),
+        rating_count    INT,
+        typical_price_low   DECIMAL(12,2),
+        typical_price_high  DECIMAL(12,2),
+        best_price_url          VARCHAR(1024),
+        popular_url             VARCHAR(1024),
+        other_attributes    JSON,
+        last_response           TEXT,
+        osb_url_match           VARCHAR(1024),
+        google_seller_page_url  VARCHAR(2048),
+        cid                     VARCHAR(64),
+        pid                     VARCHAR(64),
+        osb_position            SMALLINT        DEFAULT 0,
+        osb_id                  VARCHAR(256),
+        seller_count            SMALLINT        DEFAULT 0,
+        status                  VARCHAR(32),
+        scraped_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+        updated_at  DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_gsrt_product (product_id),
+        FOREIGN KEY (product_id) REFERENCES osb_products (product_id) ON DELETE CASCADE
+    ) ENGINE=InnoDB;
+
+    CREATE TABLE IF NOT EXISTS google_shopping_sellers_temp (
+        seller_listing_id   BIGINT AUTO_INCREMENT PRIMARY KEY,
+        result_id       BIGINT,
+        product_id      INT,
+        competitor_id   INT,
+        seller_name         VARCHAR(256),
+        seller_product_name VARCHAR(512),
+        seller_url          VARCHAR(2048),
+        price               DECIMAL(12,2),
+        original_price      DECIMAL(12,2),
+        discount_amount     DECIMAL(10,2),
+        coupon_code         VARCHAR(64),
+        coupon_remark       VARCHAR(256),
+        stock_status        VARCHAR(32),
+        seller_rating       DECIMAL(3,2),
+        delivery_tagline    VARCHAR(256),
+        google_position     SMALLINT,
+        site_display        VARCHAR(256),
+        is_me               BOOLEAN     DEFAULT FALSE,
+        scraped_at          DATETIME    DEFAULT CURRENT_TIMESTAMP,
+        seller_url_hash     CHAR(32) GENERATED ALWAYS AS (MD5(seller_url)) STORED,
+        UNIQUE KEY uq_seller_url_temp (result_id, competitor_id, seller_url_hash),
+        INDEX idx_gsst_product (product_id),
+        INDEX idx_gsst_result (result_id),
+        INDEX idx_gsst_competitor (competitor_id),
+        FOREIGN KEY (product_id) REFERENCES osb_products (product_id) ON DELETE CASCADE,
+        FOREIGN KEY (result_id) REFERENCES google_shopping_results_temp (result_id) ON DELETE CASCADE,
+        FOREIGN KEY (competitor_id) REFERENCES competitors (competitor_id)
+    ) ENGINE=InnoDB;
+
     CREATE TABLE IF NOT EXISTS seller_scrape_jobs (
         scraping_id     BIGINT AUTO_INCREMENT   PRIMARY KEY,
         product_id      INT,
@@ -640,55 +709,26 @@ def insert_to_postgres(product_results, seller_results):
                         pass
             prod_ids = sorted(list(set(parsed_prod_ids)))
             if prod_ids:
-                # Delete existing sellers for these products to prevent duplicate or stale entries
+                # Delete existing sellers and results for these products to prevent duplicate or stale entries in temp tables
                 placeholders = ", ".join(["%s"] * len(prod_ids))
-                cursor.execute(f"DELETE FROM google_shopping_sellers WHERE product_id IN ({placeholders})", tuple(prod_ids))
+                cursor.execute(f"DELETE FROM google_shopping_sellers_temp WHERE product_id IN ({placeholders})", tuple(prod_ids))
+                cursor.execute(f"DELETE FROM google_shopping_results_temp WHERE product_id IN ({placeholders})", tuple(prod_ids))
 
-        # 1. Upsert google_shopping_results (1-to-1 relationship)
+        # 1. Upsert google_shopping_results_temp (1-to-1 relationship)
+        valid_seller_results = []
         if valid_product_results:
             prod_insert = """
-                INSERT INTO google_shopping_results (
+                INSERT INTO google_shopping_results_temp (
                     product_id, google_title, google_description, gs_main_image, gs_images,
                     brand, color, width, height, depth, style, material, shape, assembly_required, weight,
                     rating_star, rating_count, typical_price_low, typical_price_high,
                     best_price_url, popular_url, other_attributes,
                     last_response, osb_url_match, google_seller_page_url, cid, pid,
                     osb_position, osb_id, seller_count, status, scraped_at, updated_at
-                ) VALUES %s
-                ON DUPLICATE KEY UPDATE
-                    google_title = VALUES(google_title),
-                    google_description = VALUES(google_description),
-                    gs_main_image = VALUES(gs_main_image),
-                    gs_images = VALUES(gs_images),
-                    brand = VALUES(brand),
-                    color = VALUES(color),
-                    width = VALUES(width),
-                    height = VALUES(height),
-                    depth = VALUES(depth),
-                    style = VALUES(style),
-                    material = VALUES(material),
-                    shape = VALUES(shape),
-                    assembly_required = VALUES(assembly_required),
-                    weight = VALUES(weight),
-                    rating_star = VALUES(rating_star),
-                    rating_count = VALUES(rating_count),
-                    typical_price_low = VALUES(typical_price_low),
-                    typical_price_high = VALUES(typical_price_high),
-                    best_price_url = VALUES(best_price_url),
-                    popular_url = VALUES(popular_url),
-                    other_attributes = VALUES(other_attributes),
-                    last_response = VALUES(last_response),
-                    osb_url_match = VALUES(osb_url_match),
-                    google_seller_page_url = VALUES(google_seller_page_url),
-                    cid = VALUES(cid),
-                    pid = VALUES(pid),
-                    osb_position = VALUES(osb_position),
-                    osb_id = VALUES(osb_id),
-                    seller_count = VALUES(seller_count),
-                    status = VALUES(status),
-                    updated_at = CURRENT_TIMESTAMP
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
             """
-            prod_values = []
             for r in valid_product_results:
                 gs_images_raw = r.get("gs_images", [])
                 if isinstance(gs_images_raw, str):
@@ -727,7 +767,7 @@ def insert_to_postgres(product_results, seller_results):
                     except:
                         typical_price_high_val = None
 
-                prod_values.append((
+                vals = (
                      _clean_int(r.get("product_id")),
                      _clean_str(r.get("google_title", r.get("product_name")), 512),
                      _clean_str(r.get("google_description", r.get("description")), default=''),
@@ -761,20 +801,21 @@ def insert_to_postgres(product_results, seller_results):
                      _clean_str(r.get("status"), 32),
                      datetime.now(),
                      datetime.now()
-                 ))
-            
-            # Chunk product insertions to fit page_size/db_page_size
-            for idx in range(0, len(prod_values), db_page_size):
-                chunk = prod_values[idx:idx + db_page_size]
-                execute_values_mysql(cursor, prod_insert, chunk)
+                )
+                
+                cursor.execute(prod_insert, vals)
+                result_id = cursor.lastrowid
+                
+                # Link all competitors of this product result with the generated result_id
+                # (Filtering out retrying/error product IDs)
+                p_code_str = str(r.get("product_id", "")).strip()
+                if p_code_str not in retry_product_ids:
+                    for competitor in r.get('competitors', []):
+                        competitor['result_id'] = result_id
+                        competitor['product_id'] = r.get("product_id")
+                        valid_seller_results.append(competitor)
 
-        # 2. Upsert google_shopping_sellers (1-to-many relationship)
-        valid_seller_results = []
-        for r in seller_results or []:
-            p_code = str(r.get("product_id", r.get("product_code", ""))).strip()
-            if p_code not in retry_product_ids:
-                valid_seller_results.append(r)
-
+        # 2. Upsert google_shopping_sellers_temp (1-to-many relationship)
         if valid_seller_results:
             # Upsert into competitors first to get their IDs and base URLs
             competitor_data = {}
@@ -846,8 +887,8 @@ def insert_to_postgres(product_results, seller_results):
                 competitor_map = {}
 
             seller_insert = """
-                INSERT INTO google_shopping_sellers (
-                    product_id, competitor_id, seller_name, seller_product_name, seller_url, price,
+                INSERT INTO google_shopping_sellers_temp (
+                    result_id, product_id, competitor_id, seller_name, seller_product_name, seller_url, price,
                     original_price, discount_amount, coupon_code, coupon_remark, stock_status,
                     seller_rating, delivery_tagline, google_position, site_display, is_me
                 ) VALUES %s
@@ -870,11 +911,12 @@ def insert_to_postgres(product_results, seller_results):
             seller_values = []
             seen_sellers = set()
             for r in valid_seller_results:
-                p_code = _clean_int(r.get("product_id", r.get("product_code")))
+                res_id = r.get("result_id")
+                p_code = _clean_int(r.get("product_id"))
                 s_name = _clean_str(r.get("seller", r.get("seller_name")), 128)
                 price = parse_price(r.get("seller_price"))
                 
-                if p_code is None or not s_name:
+                if res_id is None or p_code is None or not s_name:
                     continue
                 
                 comp_id = competitor_map.get(s_name)
@@ -888,7 +930,7 @@ def insert_to_postgres(product_results, seller_results):
                 
                 # Check for duplicates in the current batch to avoid:
                 # "ON CONFLICT DO UPDATE command cannot affect row a second time"
-                seen_key = (p_code, comp_id, url_hash)
+                seen_key = (res_id, comp_id, url_hash)
                 if seen_key in seen_sellers:
                     continue
                 seen_sellers.add(seen_key)
@@ -925,6 +967,7 @@ def insert_to_postgres(product_results, seller_results):
                 display, is_me_flag = get_site_display_and_is_me(s_name, s_name, seller_url, base_url)
 
                 seller_values.append((
+                    res_id,
                     p_code,
                     comp_id,
                     _clean_str(s_name, 256),
@@ -1779,7 +1822,7 @@ def reset_error_products_to_pending():
             "UPDATE osb_products SET scraping_status = 'pending', claimed_at = NULL, claimed_by = NULL WHERE scraping_status = 'error'"
         )
         cursor.execute(
-            "UPDATE google_shopping_results SET google_seller_page_url = NULL WHERE status IN ('selection_error', 'product_not_clickable', 'no_products', 'captcha_failed')"
+            "UPDATE google_shopping_results_temp SET google_seller_page_url = NULL WHERE status IN ('selection_error', 'product_not_clickable', 'no_products', 'captcha_failed')"
         )
         conn.commit()
         affected_rows = cursor.rowcount
@@ -1816,7 +1859,7 @@ def reset_invalid_url_products_for_retry():
         # Exclude products that failed with 'no_products' or 'no_match' status
         select_query = """
             SELECT product_id
-            FROM google_shopping_results
+            FROM google_shopping_results_temp
             WHERE google_seller_page_url NOT LIKE 'https://www.google.com/search?ibp=oshop%%'
               AND google_seller_page_url NOT LIKE 'https://share.google/%%'
               AND status NOT IN ('no_products', 'no_match')
@@ -1828,10 +1871,10 @@ def reset_invalid_url_products_for_retry():
             placeholders = ", ".join(["%s"] * len(target_ids))
             
             # 1. Delete seller records for these products
-            cursor.execute(f"DELETE FROM google_shopping_sellers WHERE product_id IN ({placeholders})", tuple(target_ids))
+            cursor.execute(f"DELETE FROM google_shopping_sellers_temp WHERE product_id IN ({placeholders})", tuple(target_ids))
             
             # 2. Delete the scraping results for these products
-            cursor.execute(f"DELETE FROM google_shopping_results WHERE product_id IN ({placeholders})", tuple(target_ids))
+            cursor.execute(f"DELETE FROM google_shopping_results_temp WHERE product_id IN ({placeholders})", tuple(target_ids))
             
             # 3. Update osb_products status to pending and clear claims/errors
             cursor.execute(
@@ -1889,7 +1932,7 @@ def generate_reconciliation_report(output_path):
                     r.updated_at, 
                     r.google_seller_page_url AS url, 
                     r.osb_url_match 
-                FROM google_shopping_results r
+                FROM google_shopping_results_temp r
                 JOIN osb_products p ON r.product_id = p.product_id
                 WHERE p.status = 1
                 """,
@@ -1910,7 +1953,7 @@ def generate_reconciliation_report(output_path):
                     s.seller_rating,
                     s.delivery_tagline,
                     s.google_position
-                FROM google_shopping_sellers s
+                FROM google_shopping_sellers_temp s
                 JOIN osb_products p ON s.product_id = p.product_id
                 WHERE p.status = 1
                 """,
@@ -3154,33 +3197,27 @@ def extract_share_url(driver):
             ))
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", share_button)
-        share_button.click()
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", share_button)
 
-        share_dialog = WebDriverWait(driver, PANEL_WAIT_SECONDS).until(
-            EC.visibility_of_element_located((By.XPATH, "//div[@role='dialog' and @aria-label='Share']"))
+        share_span_xpath = "//span[contains(text(), 'https://share.google') or contains(text(), 'https://')]"
+        share_span = WebDriverWait(driver, PANEL_WAIT_SECONDS).until(
+            EC.visibility_of_element_located((By.XPATH, share_span_xpath))
         )
+        share_url = share_span.text.strip()
 
         try:
-            share_input = share_dialog.find_element(By.CSS_SELECTOR, "input[aria-label='Share link'][type='url']")
-            share_url = (share_input.get_attribute("value") or "").strip()
-        except Exception:
-            share_url = ""
-
-        if not share_url:
-            try:
-                share_url = share_dialog.find_element(By.CSS_SELECTOR, "div[jsname='tQ9n1c']").text.strip()
-            except Exception:
-                share_url = ""
-
-        try:
-            close_button = share_dialog.find_element(By.CSS_SELECTOR, "[jsname='tqp7ud']")
+            close_button = driver.find_element(By.XPATH, "//button[@aria-label='Close']")
             close_button.click()
         except Exception:
             try:
                 ActionChains(driver).send_keys(u'\ue00c').perform()  # ESC
             except Exception:
                 pass
-    except Exception:
+    except Exception as e:
+        import traceback
+        print(f"[DEBUG ERROR] extract_share_url failed with exception: {e}")
+        traceback.print_exc()
         share_url = ""
     return share_url
 
@@ -3532,7 +3569,7 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
         phase_result['status'] = 'no_products'
         phase_result['last_response'] = f'No products found on page: {str(exc)}'
         log_matching(product_id, f"{phase_name} no products on page")
-        return phase_result, False
+        return [phase_result], False
 
     products = get_visible_product_cards(driver)
     if not products:
@@ -3540,7 +3577,7 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
         phase_result['url'] = search_url
         phase_result['status'] = 'no_products'
         phase_result['last_response'] = 'No products found in container'
-        return phase_result, False
+        return [phase_result], False
 
     limit = min(MAX_PRODUCT_TRIES, len(products))
     log_matching(product_id, f"Found {len(products)} products -> trying {limit if len(products) >= MAX_PRODUCT_TRIES else 'all'}")
@@ -3561,9 +3598,12 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
         phase_result['url'] = search_url
         phase_result['status'] = 'no_match'
         phase_result['last_response'] = 'No matching product found'
-        return phase_result, False
+        return [phase_result], False
 
     fallback_result = None
+    matched_osb_result = None
+    competitor_group_result = None
+
     for index, product_meta in enumerate(matching_products, start=1):
         log_matching(product_id, f"Trying product {index}")
         attempt_result = attempt_selected_product(driver, base_result, product_meta, osb_url)
@@ -3572,13 +3612,28 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
         if fallback_result is None:
             fallback_result = attempt_result
 
-        if attempt_result.get('osb_position', 0) <= 0:
-            log_matching(product_id, "OSB seller not present")
-        elif attempt_result.get('osb_url_match') == 'Yes':
-            log_matching(product_id, "OSB URL MATCHED -> stopping")
-            return attempt_result, True
+        is_osb_match = attempt_result.get('osb_url_match') == 'Yes'
+        is_competitor_group = (
+            attempt_result.get('seller_count', 0) > 1
+            and attempt_result.get('osb_position', 0) <= 0
+        )
+
+        if is_osb_match and not matched_osb_result:
+            log_matching(product_id, "Found matched OSB product card")
+            matched_osb_result = attempt_result
+        elif is_competitor_group and not competitor_group_result:
+            log_matching(product_id, "Found competitor group product card")
+            competitor_group_result = attempt_result
         else:
-            log_matching(product_id, "OSB URL mismatch")
+            if attempt_result.get('osb_position', 0) <= 0:
+                log_matching(product_id, "OSB seller not present")
+            else:
+                log_matching(product_id, "OSB URL mismatch")
+
+        # Early exit if we have found both
+        if matched_osb_result and competitor_group_result:
+            log_matching(product_id, "Found both matched OSB and competitor group cards -> stopping search")
+            break
 
         if index < len(matching_products):
             try:
@@ -3590,17 +3645,30 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
                 wait_for_product_container(driver, timeout=10)
                 time.sleep(random.uniform(1.0, 2.0))
 
-    return fallback_result or dict(base_result), False
+    # Formulate list of results to return
+    if matched_osb_result:
+        # If the matched OSB card only has 1 seller, and we also found a competitor group card, return both
+        if matched_osb_result.get('seller_count', 0) == 1 and competitor_group_result:
+            return [matched_osb_result, competitor_group_result], True
+        return [matched_osb_result], True
+
+    # If OSB is not matched, fallback to whatever we found
+    if competitor_group_result:
+        return [competitor_group_result], False
+    if fallback_result:
+        return [fallback_result], False
+
+    return [dict(base_result)], False
 
 def get_existing_product_url_from_db(product_id):
-    """Retrieve existing valid product_url from google_shopping_results if available."""
+    """Retrieve existing valid product_url from google_shopping_results_temp if available."""
     conn = None
     cursor = None
     try:
         conn = _get_pg_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT google_seller_page_url FROM google_shopping_results WHERE product_id = %s",
+            "SELECT google_seller_page_url FROM google_shopping_results_temp WHERE product_id = %s ORDER BY result_id DESC LIMIT 1",
             (str(product_id),)
         )
         row = cursor.fetchone()
@@ -3715,14 +3783,14 @@ def scrape_product_directly(driver, product_id, keyword, product_url, osb_url=""
         return result
 
 def reset_cached_product_url(product_id):
-    """Reset the google_seller_page_url in google_shopping_results to NULL for this product."""
+    """Reset the google_seller_page_url in google_shopping_results_temp to NULL for this product."""
     conn = None
     cursor = None
     try:
         conn = _get_pg_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE google_shopping_results SET google_seller_page_url = NULL WHERE product_id = %s",
+            "UPDATE google_shopping_results_temp SET google_seller_page_url = NULL WHERE product_id = %s",
             (str(product_id),)
         )
         conn.commit()
@@ -3754,18 +3822,24 @@ def build_fallback_search_url(name, bed_size_measure=None, mattress_size=None):
 
 def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sku="", color="", bed_size_measure="", mattress_size=""):
     """Scrape individual product from Google Shopping with multi-step search retries."""
+    print(f"\n[FLOW] scrape_product started for ID {product_id}")
     # 1. Check if we already have a valid product_url in product_scraping_results
     existing_product_url = get_existing_product_url_from_db(product_id)
     if existing_product_url:
-        print(f"Attempting to scrape directly using cached URL: {existing_product_url}")
+        print(f"  - [FLOW] Found cached URL in DB: {existing_product_url}")
+        print(f"  - [FLOW] Entering Direct URL Flow...")
         result = scrape_product_directly(driver, product_id, keyword, existing_product_url, osb_url)
         status_lower = str(result.get('status', '')).strip().lower()
+        print(f"  - [FLOW] Direct URL Flow result status: {status_lower}")
         if status_lower in {'completed', 'product_found'}:
-            return result
+            print(f"  - [FLOW] Direct URL Flow succeeded. Returning results.")
+            return [result]
         
         if status_lower in {'selection_error', 'product_not_clickable', 'no_products', 'captcha_failed', 'timeout_error', 'error'}:
-            print(f"Cached URL failed with status '{status_lower}'. Resetting cached URL and falling back to search flow.")
+            print(f"  - [FLOW] Cached URL failed. Resetting cached URL in DB and falling back to search flow.")
             reset_cached_product_url(product_id)
+    else:
+        print(f"  - [FLOW] No cached URL found in DB. Proceeding to Search Flow.")
 
     # 2. Search Flow (Retry sequence)
     last_result = None
@@ -3783,10 +3857,14 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
     if fallback_url:
         attempts.append(("Without 1stopbedrooms/color/part", fallback_url))
 
+    print(f"  - [FLOW] Configured Search Phases:")
+    for idx, (phase_name, s_url) in enumerate(attempts):
+        print(f"    {idx+1}. Phase: '{phase_name}' -> URL: {s_url}")
+
     for phase_name, search_url in attempts:
         try:
-            print(f"\n[PID {os.getpid()}] Scraper Phase: {phase_name}")
-            print(f"Search URL: {search_url}")
+            print(f"\n[FLOW] Starting Search Phase: '{phase_name}'")
+            print(f"  - Loading search page: {search_url}")
             
             driver.get(search_url)
             
@@ -3798,7 +3876,7 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
                     'last_response': 'Captcha solving failed',
                     'status': 'captcha_failed'
                 })
-                last_result = result
+                last_result = [result]
                 continue
             
             time.sleep(random.uniform(4, 8))
@@ -3806,21 +3884,21 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
             # Initialize result structure
             result = initialize_product_result(product_id, keyword, search_url)
             
-            phase_result, matched = run_product_selection_phase(
+            phase_results, matched = run_product_selection_phase(
                 driver, product_id, phase_name, search_url, result, osb_url
             )
-            last_result = phase_result
+            last_result = phase_results
             if matched:
-                return phase_result
+                return phase_results
             
             # Fallback to first matching product on page if not fully matched in standard mode
-            fallback_result, _ = run_product_selection_phase(
+            fallback_results, _ = run_product_selection_phase(
                 driver, product_id, f"{phase_name} fallback", search_url, result, osb_url, fallback_first=True
             )
-            if fallback_result.get('status') in {'completed', 'product_found', 'product_not_clickable', 'no_offers_found'}:
-                return fallback_result
+            if fallback_results and fallback_results[0].get('status') in {'completed', 'product_found', 'product_not_clickable', 'no_offers_found'}:
+                return fallback_results
             
-            last_result = fallback_result
+            last_result = fallback_results
             
         except TimeoutException as e:
             print(f"Timeout error scraping product {product_id} in phase '{phase_name}': {str(e)}")
@@ -3829,7 +3907,7 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
                 'last_response': f'Timeout Error: {str(e)}',
                 'status': 'timeout_error'
             })
-            last_result = result
+            last_result = [result]
         except Exception as e:
             print(f"Error scraping product {product_id} in phase '{phase_name}': {str(e)}")
             traceback.print_exc()
@@ -3838,9 +3916,9 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
                 'last_response': f'Error: {str(e)}',
                 'status': 'error'
             })
-            last_result = result
+            last_result = [result]
             
-    return last_result or initialize_product_result(product_id, keyword, url)
+    return last_result or [initialize_product_result(product_id, keyword, url)]
 
 def merge_csv_files(file_paths, output_path, sort_columns=None, expected_columns=None):
     """Merge CSV files into one output CSV."""
@@ -4030,6 +4108,10 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                     brand = row['brand']
                     cat = row['category']
 
+                    print(f"\n[FLOW-START] Thread {thread_id} popped Product ID: {product_id} (Web ID: {web_id})")
+                    print(f"  - Database Keyword: {keyword}")
+                    print(f"  - Database Search URL: {url}")
+
                     # Build/regenerate the search URL if it's missing or blank
                     if not url or not str(url).strip():
                         url = build_search_url(
@@ -4039,7 +4121,9 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                             bed_size_measure=row.get('bed_size_measure'),
                             mattress_size=row.get('mattress_size')
                         )
-                        print(f"[Thread {thread_id} - URL regenerated] {url}")
+                        print(f"  - [FLOW] Search URL was blank. Built dynamically: {url}")
+                    else:
+                        print(f"  - [FLOW] Using search URL from database: {url}")
 
                     # Also rebuild keyword if blank
                     if not keyword or not str(keyword).strip():
@@ -4050,6 +4134,9 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                             bed_size_measure=row.get('bed_size_measure'),
                             mattress_size=row.get('mattress_size')
                         )
+                        print(f"  - [FLOW] Keyword was blank. Built dynamically: {keyword}")
+                    else:
+                        print(f"  - [FLOW] Using keyword from database: {keyword}")
                     
                     print(f"\n[Thread {thread_id}] Processing {index+1}/{len(df)}: Product ID {product_id}")
                     
@@ -4068,7 +4155,7 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                         continue
                     
                     try:
-                        scraped_data = scrape_product(
+                        scraped_data_list = scrape_product(
                             driver, product_id, keyword, url, osb_url,
                             name=name,
                             mpn_sku=mpnsku,
@@ -4079,40 +4166,52 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                     except Exception as e:
                         print(f"[Thread {thread_id}] Error scraping product {product_id}: {str(e)}")
                         traceback.print_exc()
-                        scraped_data = None
+                        scraped_data_list = None
                     
-                    if not scraped_data:
-                        scraped_data = {
+                    if not scraped_data_list:
+                        scraped_data_list = [{
                             'product_id': product_id,
                             'status': 'error',
                             'last_response': 'Scrape failed to return data'
-                        }
+                        }]
+                    elif not isinstance(scraped_data_list, list):
+                        scraped_data_list = [scraped_data_list]
 
-                    # Add original fields back
-                    scraped_data['web_id'] = web_id
-                    scraped_data['keyword'] = keyword
-                    scraped_data['osb_url'] = osb_url
-                    scraped_data['name'] = name
-                    scraped_data['mpn_sku'] = mpnsku
-                    scraped_data['gtin'] = gtin
-                    scraped_data['brand'] = brand
-                    scraped_data['category'] = cat
+                    # Process each scraped result row for this product (e.g. OSB card and competitor group card)
+                    captcha_detected = False
+                    timeout_error_occurred = False
                     
-                    # Queue the scraped data for batch database writing
-                    db_queue.put(scraped_data)
+                    for scraped_data in scraped_data_list:
+                        # Add original fields back
+                        scraped_data['web_id'] = web_id
+                        scraped_data['keyword'] = keyword
+                        scraped_data['osb_url'] = osb_url
+                        scraped_data['name'] = name
+                        scraped_data['mpn_sku'] = mpnsku
+                        scraped_data['gtin'] = gtin
+                        scraped_data['brand'] = brand
+                        scraped_data['category'] = cat
+                        
+                        # Queue the scraped data for batch database writing
+                        db_queue.put(scraped_data)
 
-                    # Add to thread-safe results for local CSV files
-                    with results_lock:
-                        product_results.append(scraped_data)
-                        seller_results.extend(scraped_data.get('competitors', []))
-                    
-                    status_lower = str(scraped_data.get('status', '')).strip().lower()
-                    if status_lower == 'timeout_error':
+                        # Add to thread-safe results for local CSV files
+                        with results_lock:
+                            product_results.append(scraped_data)
+                            seller_results.extend(scraped_data.get('competitors', []))
+                        
+                        status_lower = str(scraped_data.get('status', '')).strip().lower()
+                        if status_lower == 'timeout_error':
+                            timeout_error_occurred = True
+                        if status_lower == 'captcha_failed':
+                            captcha_detected = True
+
+                    if timeout_error_occurred:
                         consecutive_timeouts_map[thread_id] = consecutive_timeouts_map.get(thread_id, 0) + 1
                     else:
                         consecutive_timeouts_map[thread_id] = 0
 
-                    if status_lower == 'captcha_failed':
+                    if captcha_detected:
                         print(f"[Thread {thread_id}] !!! CAPTCHA DETECTED on Product {product_id}. Stopping all threads in this chunk.")
                         stop_event.set()
                         break
@@ -4353,6 +4452,7 @@ def main():
     parser.add_argument('--start-id', type=str, default=None, help='Start product ID boundary for this account partition')
     parser.add_argument('--end-sales', type=str, default=None, help='End sales boundary for this account partition')
     parser.add_argument('--end-id', type=str, default=None, help='End product ID boundary for this account partition')
+    parser.add_argument('--product-id', type=int, default=None, help='Scrape a specific product ID and exit')
     
     args = parser.parse_args()
     args.claim_limit = int(args.claim_limit) if args.claim_limit is not None else None
@@ -4368,6 +4468,53 @@ def main():
     max_runtime_seconds = int(args.max_runtime_hours * 60 * 60)
     
     # Handlers for dedicated utility commands
+    if args.product_id:
+        conn = None
+        cursor = None
+        try:
+            conn = _get_pg_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT product_id, web_id, name, sku AS mpn_sku, gtin, brand, product_type AS category, keyword, url, osb_url, status, mfr_sales_30d AS `30daymfrsales`, scraping_status, claimed_by, claimed_at, last_attempt, error_message, created_at, updated_at, color, bed_size_measure, mattress_size
+                FROM osb_products
+                WHERE product_id = %s
+                """,
+                (args.product_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                print(f"Product {args.product_id} not found in database.")
+                sys.exit(1)
+            cols = [d[0] for d in cursor.description]
+            df = pd.DataFrame([row], columns=cols)
+            
+            # Atomically claim it
+            cursor.execute(
+                "UPDATE osb_products SET scraping_status = 'claimed', claimed_by = 'manual_single', claimed_at = NOW() WHERE product_id = %s",
+                (args.product_id,)
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"Error preparing product {args.product_id}: {e}")
+            sys.exit(1)
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
+        chunk_result = process_chunk(
+            df,
+            chunk_id=1,
+            total_chunks=1,
+            worker_id='manual_single',
+            ttl_minutes=60,
+            max_runtime_seconds=3600,
+            max_workers=1,
+        )
+        sys.exit(0 if chunk_result.get("success", False) else 1)
+
     if args.reset_errors:
         reset_invalid_url_products_for_retry()
         sys.exit(0)
