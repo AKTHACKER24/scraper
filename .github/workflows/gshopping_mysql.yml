@@ -233,6 +233,10 @@ jobs:
           MYSQL_USER: ${{ secrets.MYSQL_USER }}
           MYSQL_PASS: ${{ secrets.MYSQL_PASS }}
           MYSQL_DB: ${{ secrets.MYSQL_DB }}
+          START_SALES: ${{ github.event.inputs.start_sales }}
+          START_ID: ${{ github.event.inputs.start_id }}
+          END_SALES: ${{ github.event.inputs.end_sales }}
+          END_ID: ${{ github.event.inputs.end_id }}
         run: |
           python - <<'PY'
           import os
@@ -249,9 +253,15 @@ jobs:
               mysql_pass = os.environ.get("MYSQL_PASS")
               mysql_db = os.environ.get("MYSQL_DB")
               
+              start_sales = os.environ.get("START_SALES", "").strip()
+              start_id = os.environ.get("START_ID", "").strip()
+              end_sales = os.environ.get("END_SALES", "").strip()
+              end_id = os.environ.get("END_ID", "").strip()
+              
               import time
+              import random
               conn = None
-              max_retries = 5
+              max_retries = 8
               for attempt in range(1, max_retries + 1):
                   try:
                       conn = pymysql.connect(
@@ -260,7 +270,7 @@ jobs:
                           user=mysql_user,
                           password=mysql_pass,
                           database=mysql_db,
-                          connect_timeout=15
+                          connect_timeout=30
                       )
                       print(f"Successfully connected to MySQL on attempt {attempt}")
                       break
@@ -268,23 +278,36 @@ jobs:
                       print(f"Connection attempt {attempt} failed: {err}")
                       if attempt == max_retries:
                           raise
-                      time.sleep(2 ** attempt)
+                      # Exponential backoff with random jitter
+                      sleep_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+                      time.sleep(sleep_time)
               
               cursor = conn.cursor()
-              cursor.execute("""
+              params = []
+              clauses = ["status = 1", "scraping_status IN ('pending', 'claimed')"]
+              if start_id:
+                  sales_val = int(start_sales) if start_sales else 0
+                  params.extend([sales_val, sales_val, start_id])
+                  clauses.append("(COALESCE(mfr_sales_30d, 0) < %s OR (COALESCE(mfr_sales_30d, 0) = %s AND product_id >= %s))")
+              if end_id:
+                  sales_val = int(end_sales) if end_sales else 0
+                  params.extend([sales_val, sales_val, end_id])
+                  clauses.append("(COALESCE(mfr_sales_30d, 0) > %s OR (COALESCE(mfr_sales_30d, 0) = %s AND product_id <= %s))")
+              
+              query = f"""
                   SELECT
                       COALESCE(SUM(CASE WHEN scraping_status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
                       COALESCE(SUM(CASE WHEN scraping_status = 'claimed' THEN 1 ELSE 0 END), 0) AS claimed_count
                   FROM osb_products
-                  WHERE scraping_status IN ('pending', 'claimed')
-                    AND status = 1
-              """)
+                  WHERE {" AND ".join(clauses)}
+              """
+              cursor.execute(query, tuple(params))
               pending_count, claimed_count = cursor.fetchone()
               cursor.close()
               conn.close()
               
-              print(f"Pending products: {pending_count}")
-              print(f"Claimed/in-progress products: {claimed_count}")
+              print(f"Pending products in boundary: {pending_count}")
+              print(f"Claimed/in-progress products in boundary: {claimed_count}")
               
               with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
                   f.write(f"pending_count={pending_count}\n")
