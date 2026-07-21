@@ -117,8 +117,6 @@ jobs:
 
           if [ -n "$PRODUCT_ID" ]; then
             TOTAL_CHUNKS=1
-          elif [ "$RETRY_MISSING" = "true" ] && [ -n "$LIMIT_VAL" ]; then
-            TOTAL_CHUNKS=1
           else
             TOTAL_CHUNKS=${{ github.event.inputs.total_chunks || 20 }}
           fi

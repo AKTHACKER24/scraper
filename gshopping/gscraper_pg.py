@@ -4161,6 +4161,14 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                 "remaining_rows": 0,
             }
         df = df.reset_index(drop=True)
+        if total_chunks > 1 and len(df) >= total_chunks:
+            chunk_size = len(df) // total_chunks
+            remainder = len(df) % total_chunks
+            start_i = (chunk_id - 1) * chunk_size + min(chunk_id - 1, remainder)
+            end_i = start_i + chunk_size + (1 if (chunk_id - 1) < remainder else 0)
+            df = df.iloc[start_i:end_i].reset_index(drop=True)
+            print(f"Worker {chunk_id}/{total_chunks} assigned {len(df)} products (rows {start_i+1} to {end_i})")
+
         resolved_worker_id = _get_worker_id(worker_id)
         started_at = time.monotonic()
 
