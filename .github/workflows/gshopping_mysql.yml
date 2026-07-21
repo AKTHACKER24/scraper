@@ -3,6 +3,21 @@ name: Google Shopping Scraper (MySQL Flow)
 on:
   workflow_dispatch:
     inputs:
+      product_id:
+        description: "Scrape a single specific Product ID (e.g. 40561). Leave blank for full run."
+        required: false
+        default: ""
+        type: string
+      retry_missing_osb:
+        description: "Re-scrape products with missing OSB data (osb_url_match = No)"
+        required: false
+        default: false
+        type: boolean
+      limit:
+        description: "Limit total products to process (e.g. 100)"
+        required: false
+        default: ""
+        type: string
       input_filename:
         description: "Input CSV filename (optional, ignored)"
         required: false
@@ -96,7 +111,17 @@ jobs:
 
       - id: matrix
         run: |
-          TOTAL_CHUNKS=${{ github.event.inputs.total_chunks || 20 }}
+          PRODUCT_ID="${{ github.event.inputs.product_id }}"
+          RETRY_MISSING="${{ github.event.inputs.retry_missing_osb }}"
+          LIMIT_VAL="${{ github.event.inputs.limit }}"
+
+          if [ -n "$PRODUCT_ID" ]; then
+            TOTAL_CHUNKS=1
+          elif [ "$RETRY_MISSING" = "true" ] && [ -n "$LIMIT_VAL" ]; then
+            TOTAL_CHUNKS=1
+          else
+            TOTAL_CHUNKS=${{ github.event.inputs.total_chunks || 20 }}
+          fi
 
           MATRIX="["
           for ((i=1;i<=TOTAL_CHUNKS;i++)); do
@@ -197,18 +222,31 @@ jobs:
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 3
 
+          PRODUCT_ID="${{ github.event.inputs.product_id }}"
+          RETRY_MISSING="${{ github.event.inputs.retry_missing_osb }}"
+          LIMIT_VAL="${{ github.event.inputs.limit }}"
           TOTAL_WORKERS="${{ github.event.inputs.total_chunks || 20 }}"
 
-          python -u gshopping/gscraper_pg.py \
-            --chunk-id ${{ matrix.worker_index }} \
-            --total-chunks "$TOTAL_WORKERS" \
-            --products-per-hour "$PRODUCTS_PER_HOUR" \
-            --max-runtime-hours "$MAX_RUNTIME_HOURS" \
-            --worker-id "$SCRAPER_WORKER_ID" \
-            --start-sales "${{ github.event.inputs.start_sales }}" \
-            --start-id "${{ github.event.inputs.start_id }}" \
-            --end-sales "${{ github.event.inputs.end_sales }}" \
-            --end-id "${{ github.event.inputs.end_id }}"
+          if [ -n "$PRODUCT_ID" ]; then
+            python -u gshopping/gscraper_pg.py --product-id "$PRODUCT_ID"
+          elif [ "$RETRY_MISSING" = "true" ]; then
+            CMD_ARGS=("--retry-missing-osb" "--chunk-id" "${{ matrix.worker_index }}" "--total-chunks" "$TOTAL_WORKERS" "--products-per-hour" "$PRODUCTS_PER_HOUR" "--max-runtime-hours" "$MAX_RUNTIME_HOURS" "--worker-id" "$SCRAPER_WORKER_ID")
+            if [ -n "$LIMIT_VAL" ]; then
+              CMD_ARGS+=("--limit" "$LIMIT_VAL")
+            fi
+            python -u gshopping/gscraper_pg.py "${CMD_ARGS[@]}"
+          else
+            python -u gshopping/gscraper_pg.py \
+              --chunk-id ${{ matrix.worker_index }} \
+              --total-chunks "$TOTAL_WORKERS" \
+              --products-per-hour "$PRODUCTS_PER_HOUR" \
+              --max-runtime-hours "$MAX_RUNTIME_HOURS" \
+              --worker-id "$SCRAPER_WORKER_ID" \
+              --start-sales "${{ github.event.inputs.start_sales }}" \
+              --start-id "${{ github.event.inputs.start_id }}" \
+              --end-sales "${{ github.event.inputs.end_sales }}" \
+              --end-id "${{ github.event.inputs.end_id }}"
+          fi
 
   dispatch_next_round:
     needs: scrape
@@ -319,7 +357,7 @@ jobs:
           PY
 
       - name: Trigger next round workflow
-        if: ${{ fromJSON(steps.check_rem.outputs.pending_count || '0') > 0 && fromJSON(github.event.inputs.run_depth || '1') < fromJSON(github.event.inputs.max_depth || '50') }}
+        if: ${{ (github.event.inputs.product_id == '' || github.event.inputs.product_id == null) && (github.event.inputs.retry_missing_osb != 'true') && fromJSON(steps.check_rem.outputs.pending_count || '0') > 0 && fromJSON(github.event.inputs.run_depth || '1') < fromJSON(github.event.inputs.max_depth || '50') }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}

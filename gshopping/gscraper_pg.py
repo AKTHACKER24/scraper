@@ -2491,7 +2491,7 @@ def get_chrome_major_version():
                     val = int(match.group(1))
                     print(f"✓ Detected Google Chrome major version: {val}")
                     return val
-            except:
+            except Exception:
                 continue
     except Exception as e:
         print(f"Error detecting Chrome version: {e}")
@@ -2499,6 +2499,7 @@ def get_chrome_major_version():
 
 def setup_driver(max_attempts=3, base_delay=4, headless=False):
     last_err = None
+    override_version_main = None
     
     def build_chrome_options():
         options = uc.ChromeOptions()
@@ -2524,7 +2525,7 @@ def setup_driver(max_attempts=3, base_delay=4, headless=False):
             chrome_bin = os.environ.get("CHROME_BIN")
             chromedriver_bin = os.environ.get("CHROMEDRIVER_BIN")
             
-            major_ver = get_chrome_major_version()
+            major_ver = override_version_main or get_chrome_major_version()
             
             uc_kwargs = {
                 "options": options
@@ -2553,7 +2554,16 @@ def setup_driver(max_attempts=3, base_delay=4, headless=False):
 
         except Exception as e:
             last_err = e
-            print(f"Driver start failed (attempt {attempt}/{max_attempts}): {str(e)}")
+            err_msg = str(e)
+            print(f"Driver start failed (attempt {attempt}/{max_attempts}): {err_msg}")
+            
+            # Auto-recover if version mismatch error indicates installed Chrome version
+            match = re.search(r'Current browser version is\s+(\d+)\.', err_msg, re.IGNORECASE)
+            if match:
+                detected_ver = int(match.group(1))
+                print(f"  -> Extracted actual system Chrome version from error: {detected_ver}. Will use version_main={detected_ver} on retry.")
+                override_version_main = detected_ver
+
             try:
                 if driver:
                     driver.quit()
@@ -3481,23 +3491,28 @@ def populate_offers_for_selected_product(driver, result, product_id, osb_url):
         competitors.append(competitor_data)
         result['competitors'].append(competitor_data)
 
-    search_seller = '1StopBedrooms'
     sellers = [c['seller'] for c in competitors]
     osb_position = 0
     seller_count = len(sellers)
     osb_id = ''
     osb_url_match = False
 
-    if search_seller in sellers:
-        osb_position = sellers.index(search_seller) + 1
-        for competitor in competitors:
-            if competitor['seller'] == search_seller:
-                seller_slug = normalize_url_path_slug(competitor.get('seller_url', ''))
-                osb_id = seller_slug
-                target_slug = normalize_url_path_slug(osb_url)
-                if seller_slug and target_slug:
-                    osb_url_match = seller_slug == target_slug
-                break
+    # Case-insensitive seller store name & URL domain matching
+    for idx, competitor in enumerate(competitors, start=1):
+        c_seller = str(competitor.get('seller', '')).lower().replace(" ", "").replace(".com", "")
+        c_url = str(competitor.get('seller_url', '')).lower()
+        if c_seller == '1stopbedrooms' or '1stopbedrooms' in c_seller or '1stopbedrooms.com' in c_url:
+            if osb_position == 0:
+                osb_position = idx
+            seller_slug = normalize_url_path_slug(competitor.get('seller_url', ''))
+            osb_id = seller_slug
+            target_slug = normalize_url_path_slug(osb_url)
+            if seller_slug and target_slug:
+                if seller_slug == target_slug or seller_slug in target_slug or target_slug in seller_slug:
+                    osb_url_match = True
+            elif '1stopbedrooms.com' in c_url:
+                osb_url_match = True
+            break
 
     # Calculate best_price_url from competitors
     best_price_url = ""
@@ -3645,6 +3660,8 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
         if is_osb_match and not matched_osb_result:
             log_matching(product_id, "Found matched OSB product card")
             matched_osb_result = attempt_result
+            log_matching(product_id, f"OSB matched successfully (Sellers count: {matched_osb_result.get('seller_count', 0)}) -> stopping product selection loop")
+            break
         elif is_competitor_group and not competitor_group_result:
             log_matching(product_id, "Found competitor group product card")
             competitor_group_result = attempt_result
@@ -3685,12 +3702,27 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
     return [dict(base_result)], False
 
 def get_existing_product_url_from_db(product_id):
-    """Retrieve existing valid product_url from google_shopping_results if available and OSB URL Match is 'Yes'."""
+    """Retrieve existing valid product_url from google_shopping_results_temp OR main reference table google_shopping_results if available and OSB URL Match is 'Yes'."""
     conn = None
     cursor = None
     try:
         conn = _get_pg_conn()
         cursor = conn.cursor()
+        # 1. Check working temp table first
+        cursor.execute(
+            "SELECT google_seller_page_url, osb_url_match FROM google_shopping_results_temp WHERE product_id = %s",
+            (str(product_id),)
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            p_url = row[0].strip()
+            osb_match = str(row[1] or '').strip()
+            if osb_match == 'Yes':
+                is_valid_url = p_url.startswith("https://www.google.com/search?ibp=oshop") or p_url.startswith("https://share.google/")
+                if is_valid_url:
+                    return p_url
+
+        # 2. Check main reference table (read-only) if temp table didn't have valid match
         cursor.execute(
             "SELECT google_seller_page_url, osb_url_match FROM google_shopping_results WHERE product_id = %s",
             (str(product_id),)
@@ -3831,6 +3863,81 @@ def reset_cached_product_url(product_id):
         if conn:
             conn.close()
 
+def build_brand_mpn_search_url(brand, mpn, name=None):
+    """
+    Build a search URL focused on Brand + MPN:
+    1stopbedrooms "{brand}" "{mpn}"
+    """
+    if not (brand and str(brand).strip()) or not (mpn and str(mpn).strip()):
+        return None
+    
+    clean_b = str(brand).strip()
+    clean_m = str(mpn).strip()
+    parts = ['1stopbedrooms', f'"{clean_b}"', f'"{clean_m}"']
+    query = ' '.join(parts).replace(' ', '+').replace('#', '')
+    return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
+
+
+def build_gtin_search_url(gtin):
+    """
+    Build a search URL focused on GTIN:
+    1stopbedrooms "{gtin}"
+    """
+    if not gtin or not str(gtin).strip() or str(gtin).strip().lower() in ('0', 'none', 'nan', 'null'):
+        return None
+    
+    clean_gtin = str(gtin).strip()
+    parts = ['1stopbedrooms', f'"{clean_gtin}"']
+    query = ' '.join(parts).replace(' ', '+').replace('#', '')
+    return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
+
+
+def build_clean_title_search_url(brand, name):
+    """
+    Build a search URL focused on Cleaned Brand + Core Product Title:
+    1stopbedrooms {brand} {core_title_words}
+    """
+    if not name or not str(name).strip():
+        return None
+    
+    clean_n = _decode_html_entities(str(name).strip())
+    clean_n = re.sub(r'[^\w\s-]', '', clean_n)
+    words = [w for w in clean_n.split() if w.lower() not in ('set', 'of', 'and')]
+    if not words:
+        return None
+    
+    parts = ['1stopbedrooms']
+    if brand and str(brand).strip():
+        parts.append(str(brand).strip())
+    parts.extend(words[:5])
+    
+    query = '+'.join(parts).replace(' ', '+').replace('#', '')
+    return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
+
+
+def build_site_search_url(mpn=None, osb_url=None):
+    """
+    Build a targeted site search or slug search URL:
+    site:1stopbedrooms.com "{mpn}" or 1stopbedrooms "{slug}"
+    """
+    if mpn and str(mpn).strip():
+        query = f'site:1stopbedrooms.com+"{str(mpn).strip()}"'
+        return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
+    
+    if osb_url and str(osb_url).strip():
+        try:
+            parsed = urlparse(osb_url)
+            path = parsed.path.rstrip('/')
+            if path:
+                slug = os.path.basename(path).replace('.html', '').replace('-', ' ')
+                if slug:
+                    query = f'1stopbedrooms+{slug}'.replace(' ', '+')
+                    return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
+        except Exception:
+            pass
+    return None
+
+
 def build_fallback_search_url(name, bed_size_measure=None, mattress_size=None):
     """
     Build a broad fallback search URL:
@@ -3846,13 +3953,13 @@ def build_fallback_search_url(name, bed_size_measure=None, mattress_size=None):
     query = ' '.join(parts).replace(' ', '+').replace('#', '')
     return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
 
-def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sku="", color="", bed_size_measure="", mattress_size=""):
+def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sku="", color="", bed_size_measure="", mattress_size="", brand="", gtin=""):
     """Scrape individual product from Google Shopping with multi-step search retries."""
     print(f"\n[FLOW] scrape_product started for ID {product_id}")
-    # 1. Check if we already have a valid product_url in product_scraping_results
+    # 1. Check if we already have a valid product_url in temp DB or main reference DB
     existing_product_url = get_existing_product_url_from_db(product_id)
     if existing_product_url:
-        print(f"  - [FLOW] Found cached URL in DB: {existing_product_url}")
+        print(f"  - [FLOW] Found cached/reference URL in DB: {existing_product_url}")
         print(f"  - [FLOW] Entering Direct URL Flow...")
         result = scrape_product_directly(driver, product_id, keyword, existing_product_url, osb_url)
         status_lower = str(result.get('status', '')).strip().lower()
@@ -3867,21 +3974,48 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
     else:
         print(f"  - [FLOW] No cached URL found in DB. Proceeding to Search Flow.")
 
-    # 2. Search Flow (Retry sequence)
+    # 2. Multi-Tier Search Flow (Retry sequence focused on matching OSB data)
     last_result = None
     
-    # Define retry attempts
+    # Define retry attempts in order of priority:
+    # 1) Original search URL (with 1stopbedrooms prefix)
+    # 2) Original search URL WITHOUT 1stopbedrooms prefix
+    # 3) Brand + MPN search URL
+    # 4) Brand + MPN search URL WITHOUT 1stopbedrooms prefix
+    # 5) GTIN search URL
+    # 6) Cleaned core title search URL
+    # 7) Without 1stopbedrooms/color/part fallback URL
+    # 8) Site / slug search URL
     attempts = [
         ("Original search", url),
     ]
     
     retry_url = build_retry_search_url(url)
-    if retry_url != url:
-        attempts.append(("Without 1stopbedrooms prefix", retry_url))
+    if retry_url and retry_url != url:
+        attempts.append(("Original search without 1stopbedrooms", retry_url))
+
+    brand_mpn_url = build_brand_mpn_search_url(brand, mpn_sku, name)
+    if brand_mpn_url and brand_mpn_url not in (url, retry_url):
+        attempts.append(("Brand + MPN search", brand_mpn_url))
+        brand_mpn_no_osb = build_retry_search_url(brand_mpn_url)
+        if brand_mpn_no_osb and brand_mpn_no_osb not in (url, retry_url, brand_mpn_url):
+            attempts.append(("Brand + MPN search without 1stopbedrooms", brand_mpn_no_osb))
         
+    gtin_url = build_gtin_search_url(gtin)
+    if gtin_url and gtin_url not in (url, retry_url, brand_mpn_url):
+        attempts.append(("GTIN search", gtin_url))
+        
+    clean_title_url = build_clean_title_search_url(brand, name)
+    if clean_title_url and clean_title_url not in (url, retry_url, brand_mpn_url):
+        attempts.append(("Cleaned core title search", clean_title_url))
+
     fallback_url = build_fallback_search_url(name, bed_size_measure, mattress_size)
-    if fallback_url:
-        attempts.append(("Without 1stopbedrooms/color/part", fallback_url))
+    if fallback_url and fallback_url not in (url, retry_url, clean_title_url):
+        attempts.append(("Without 1stopbedrooms/color/part fallback", fallback_url))
+
+    site_url = build_site_search_url(mpn_sku, osb_url)
+    if site_url and site_url not in (url, brand_mpn_url, gtin_url):
+        attempts.append(("Site / slug search", site_url))
 
     print(f"  - [FLOW] Configured Search Phases:")
     for idx, (phase_name, s_url) in enumerate(attempts):
@@ -3910,21 +4044,24 @@ def scrape_product(driver, product_id, keyword, url, osb_url="", name="", mpn_sk
             # Initialize result structure
             result = initialize_product_result(product_id, keyword, search_url)
             
-            phase_result, matched = run_product_selection_phase(
+            phase_results, matched = run_product_selection_phase(
                 driver, product_id, phase_name, search_url, result, osb_url, skip_navigation=True
             )
             last_result = phase_results
             if matched:
+                print(f"  - [FLOW] Phase '{phase_name}' successfully matched OSB! Returning results.")
                 return phase_results
             
             # Fallback to first matching product on page if not fully matched in standard mode
-            fallback_results, _ = run_product_selection_phase(
+            fallback_results, matched_fallback = run_product_selection_phase(
                 driver, product_id, f"{phase_name} fallback", search_url, result, osb_url, fallback_first=True
             )
-            if fallback_results and fallback_results[0].get('status') in {'completed', 'product_found', 'product_not_clickable', 'no_offers_found'}:
+            if matched_fallback:
+                print(f"  - [FLOW] Fallback in phase '{phase_name}' matched OSB! Returning results.")
                 return fallback_results
-            
-            last_result = fallback_results
+
+            if fallback_results and fallback_results[0].get('status') in {'completed', 'product_found', 'product_not_clickable', 'no_offers_found'}:
+                last_result = fallback_results
             
         except TimeoutException as e:
             print(f"Timeout error scraping product {product_id} in phase '{phase_name}': {str(e)}")
@@ -4187,7 +4324,9 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                             mpn_sku=mpnsku,
                             color=row.get('color'),
                             bed_size_measure=row.get('bed_size_measure'),
-                            mattress_size=row.get('mattress_size')
+                            mattress_size=row.get('mattress_size'),
+                            brand=brand,
+                            gtin=gtin
                         )
                     except Exception as e:
                         print(f"[Thread {thread_id}] Error scraping product {product_id}: {str(e)}")
@@ -4479,6 +4618,8 @@ def main():
     parser.add_argument('--end-sales', type=str, default=None, help='End sales boundary for this account partition')
     parser.add_argument('--end-id', type=str, default=None, help='End product ID boundary for this account partition')
     parser.add_argument('--product-id', type=int, default=None, help='Scrape a specific product ID and exit')
+    parser.add_argument('--retry-missing-osb', action='store_true', help='Fetch and re-scrape all temp records where osb_url_match = "No"')
+    parser.add_argument('--limit', type=int, default=None, help='Limit total products to process (e.g. --limit 5)')
     
     args = parser.parse_args()
     args.claim_limit = int(args.claim_limit) if args.claim_limit is not None else None
@@ -4494,6 +4635,80 @@ def main():
     max_runtime_seconds = int(args.max_runtime_hours * 60 * 60)
     
     # Handlers for dedicated utility commands
+    if args.retry_missing_osb:
+        print("=" * 60)
+        print("Re-scraping products with missing OSB data (osb_url_match = 'No')")
+        print("=" * 60)
+        conn = None
+        cursor = None
+        try:
+            conn = _get_pg_conn()
+            cursor = conn.cursor()
+            query = """
+                SELECT p.product_id, p.web_id, p.name, p.sku AS mpn_sku, p.gtin, p.brand, 
+                       p.product_type AS category, p.keyword, p.url, p.osb_url, p.status, 
+                       p.mfr_sales_30d AS `30daymfrsales`, p.scraping_status, p.claimed_by, 
+                       p.claimed_at, p.last_attempt, p.error_message, p.created_at, p.updated_at, 
+                       p.color, p.bed_size_measure, p.mattress_size, p.grouping_attr_1_value, p.grouping_attr_2_value
+                FROM google_shopping_results_temp r
+                JOIN osb_products p ON r.product_id = p.product_id
+                WHERE (r.osb_url_match = 'No' OR r.osb_url_match IS NULL OR r.osb_url_match = '')
+                  AND p.status = 1
+                ORDER BY p.product_id ASC
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            if not rows:
+                print("No products with osb_url_match = 'No' found in google_shopping_results_temp.")
+                sys.exit(0)
+            
+            cols = [d[0] for d in cursor.description]
+            df = pd.DataFrame(rows, columns=cols)
+            
+            # Apply limit if --limit or --claim-limit is provided
+            limit_val = args.limit or args.claim_limit
+            if limit_val and limit_val > 0:
+                df = df.head(limit_val)
+                print(f"Limiting run to first {len(df)} missing OSB products.")
+                
+            product_ids = [int(pid) for pid in df['product_id'].tolist()]
+            print(f"Processing {len(product_ids)} products with missing OSB data in google_shopping_results_temp.")
+            
+            # Reset scraping_status in osb_products to pending so worker threads can claim and process them
+            placeholders = ','.join(['%s'] * len(product_ids))
+            cursor.execute(
+                f"UPDATE osb_products SET scraping_status = 'pending', claimed_by = NULL, claimed_at = NULL WHERE product_id IN ({placeholders})",
+                tuple(product_ids)
+            )
+            conn.commit()
+            print(f"✓ Reset {len(product_ids)} products to 'pending' in osb_products table.")
+        except Exception as e:
+            print(f"Error preparing missing OSB products for re-scraping: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        chunk_result = process_chunk(
+            df,
+            chunk_id=args.chunk_id,
+            total_chunks=args.total_chunks,
+            worker_id=args.worker_id or 'missing_osb_retry',
+            ttl_minutes=args.claim_ttl_minutes,
+            max_runtime_seconds=max_runtime_seconds,
+            max_workers=args.max_workers,
+        )
+        sys.exit(0 if chunk_result.get("success", False) else 1)
+
     if args.product_id:
         conn = None
         cursor = None
