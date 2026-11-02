@@ -18,14 +18,18 @@ on:
         description: "Custom site URL (optional, overrides target selection if set)"
         required: false
         default: ""
-      total_sitemaps:
-        description: "Total sitemaps to process per site (0 = auto / scale to 10 parallel jobs)"
+      sitemap_url:
+        description: "Custom sitemap URL override (optional, single site only)"
+        required: false
+        default: ""
+      urls_per_runner:
+        description: "Max product URLs to scrape per parallel runner"
+        default: "1500"
+      total_runners_per_site:
+        description: "Parallel runners per site (0 = auto-calculate based on URLs)"
         default: "0"
-      sitemaps_per_job:
-        description: "Sitemaps per parallel job"
-        default: "1"
-      urls_per_sitemap:
-        description: "Max URLs per sitemap (0 = full scrape / unlimited)"
+      max_total_urls:
+        description: "Max total URLs to scrape per site (0 = all / full)"
         default: "0"
       max_workers:
         description: "Parallel requests per job"
@@ -33,10 +37,15 @@ on:
       request_delay:
         description: "Delay between requests (seconds)"
         default: "0.2"
-      sitemap_url:
-        description: "Custom sitemap URL override (optional, single site only)"
-        required: false
-        default: ""
+      total_sitemaps:
+        description: "Legacy: Total sitemaps (deprecated, auto-discovered)"
+        default: "0"
+      sitemaps_per_job:
+        description: "Legacy: Sitemaps per job (deprecated, now partitioned by URLs)"
+        default: "1"
+      urls_per_sitemap:
+        description: "Legacy: Max URLs per sitemap (0 = full scrape / unlimited)"
+        default: "0"
 
 env:
   FTP_HOST: ${{ secrets.FTP_HOST || 'ftp-sandbox.1sb.pp.ua' }}
@@ -50,28 +59,74 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.generate_matrix.outputs.matrix }}
+
+    # Service container for Cloudflare bypass during sitemap discovery
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
+
     steps:
-      - name: Generate matrix for selected site(s)
+      - uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
+
+      - name: Discover all sitemaps, count products, and partition runners
         id: generate_matrix
         env:
           TARGET_SITE: ${{ github.event.inputs.target_site }}
           CUSTOM_URL: ${{ github.event.inputs.custom_url }}
           CUSTOM_SITEMAP: ${{ github.event.inputs.sitemap_url }}
-          TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
-          PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
+          URLS_PER_RUNNER: ${{ github.event.inputs.urls_per_runner }}
+          TOTAL_RUNNERS_PER_SITE: ${{ github.event.inputs.total_runners_per_site }}
+          MAX_TOTAL_URLS: ${{ github.event.inputs.max_total_urls }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
         run: |
           python3 - << 'EOF'
           import os
+          import sys
           import json
+          import math
+          import subprocess
           from urllib.parse import urlparse
 
           target = os.environ.get("TARGET_SITE", "ALL")
           custom_url = os.environ.get("CUSTOM_URL", "").strip()
           custom_sitemap = os.environ.get("CUSTOM_SITEMAP", "").strip()
-          total_input = int(os.environ.get("TOTAL_SITEMAPS", "0") or "0")
-          per_job = int(os.environ.get("PER_JOB", "1") or "1")
-          if per_job < 1:
-              per_job = 1
+          urls_per_runner = int(os.environ.get("URLS_PER_RUNNER", "1500") or "1500")
+          total_runners_input = int(os.environ.get("TOTAL_RUNNERS_PER_SITE", "0") or "0")
+          max_total_urls = int(os.environ.get("MAX_TOTAL_URLS", "0") or "0")
 
           all_sites = [
               {
@@ -121,33 +176,133 @@ jobs:
           else:
               selected = [s for s in all_sites if s["site_key"] == "discountlivingrooms"]
 
+          os.makedirs("url_chunks", exist_ok=True)
           matrix_items = []
+
           for s in selected:
+              site_key = s["site_key"]
+              competitor = s["competitor"]
+              site_url = s["url"]
               site_sitemap = custom_sitemap if (custom_sitemap and len(selected) == 1) else s["sitemap_url"]
-              # Auto mode scales up to 10 parallel matrix jobs per site
-              total = total_input if total_input > 0 else 10
-              jobs = max(1, (total + per_job - 1) // per_job)
-              for i in range(jobs):
+              site_master_file = f"all_urls_{site_key}.txt"
+
+              print(f"\n============================================================")
+              print(f" Checking all sitemaps for site: {site_key} ({competitor})")
+              print(f" Base URL: {site_url}")
+              print(f" Sitemap: {site_sitemap}")
+              print(f"============================================================")
+
+              env_copy = os.environ.copy()
+              env_copy["CURR_URL"] = site_url
+              env_copy["SITE_NAME"] = site_key
+              env_copy["SITEMAP_URL"] = site_sitemap
+              env_copy["MASTER_URLS_FILE"] = site_master_file
+              env_copy["COLLECT_URLS_ONLY"] = "1"
+
+              res = subprocess.run([sys.executable, "drl/dlr_scraper.py"], env=env_copy)
+              if res.returncode != 0:
+                  print(f"⚠ Warning: URL collection for {site_key} returned code {res.returncode}")
+
+              if not os.path.exists(site_master_file):
+                  print(f"⚠ No URL file generated for {site_key}, creating empty file.")
+                  with open(site_master_file, "w") as f:
+                      pass
+
+              with open(site_master_file, "r", encoding="utf-8") as f:
+                  urls = [line.strip() for line in f if line.strip() and line.strip().startswith("http")]
+
+              site_total_urls = len(urls)
+              print(f"Total product URLs discovered for {site_key}: {site_total_urls:,}")
+
+              if max_total_urls > 0 and max_total_urls < site_total_urls:
+                  print(f"Limiting {site_key} to first {max_total_urls:,} URLs as requested")
+                  urls = urls[:max_total_urls]
+                  site_total_urls = len(urls)
+
+              if site_total_urls == 0:
+                  print(f"No URLs to process for {site_key}, skipping chunk generation.")
+                  continue
+
+              if total_runners_input > 0:
+                  site_chunks = total_runners_input
+                  urls_per_chunk = math.ceil(site_total_urls / site_chunks)
+              else:
+                  chunk_rate = urls_per_runner if urls_per_runner >= 100 else 1500
+                  site_chunks = math.ceil(site_total_urls / chunk_rate)
+                  urls_per_chunk = chunk_rate
+
+              # Cap runners per site to prevent exceeding GitHub matrix limits
+              max_per_site = 60 if len(selected) > 1 else 100
+              if site_chunks > max_per_site:
+                  print(f"Capping runners for {site_key} at {max_per_site} (would have been {site_chunks})")
+                  site_chunks = max_per_site
+                  urls_per_chunk = math.ceil(site_total_urls / site_chunks)
+
+              if site_chunks < 1:
+                  site_chunks = 1
+
+              for i in range(site_chunks):
+                  start_idx = i * urls_per_chunk
+                  end_idx = min(start_idx + urls_per_chunk, site_total_urls)
+                  chunk_urls = urls[start_idx:end_idx]
+                  if not chunk_urls:
+                      continue
+                  chunk_file = f"url_chunks/{site_key}_chunk_{i}.txt"
+                  with open(chunk_file, "w", encoding="utf-8") as cf:
+                      cf.write("\n".join(chunk_urls))
                   matrix_items.append({
-                      "site_key": s["site_key"],
-                      "competitor": s["competitor"],
-                      "url": s["url"],
+                      "site_key": site_key,
+                      "competitor": competitor,
+                      "url": site_url,
                       "sitemap_url": site_sitemap,
-                      "offset": i * per_job,
-                      "limit": per_job,
+                      "chunk_index": i,
+                      "total_chunks": site_chunks,
+                      "chunk_file": chunk_file,
+                      "url_count": len(chunk_urls),
                   })
 
+              print(f"Divided {site_total_urls:,} URLs for {site_key} into {site_chunks} runners (~{urls_per_chunk:,} URLs/runner)")
+
+          if not matrix_items:
+              print("No matrix items generated, creating fallback job.")
+              matrix_items.append({
+                  "site_key": "discountlivingrooms",
+                  "competitor": "DiscountLivingRooms",
+                  "url": "https://www.discountlivingrooms.com",
+                  "sitemap_url": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
+                  "chunk_index": 0,
+                  "total_chunks": 1,
+                  "chunk_file": "",
+                  "url_count": 0,
+              })
+
           matrix_json = json.dumps(matrix_items)
-          print("Generated Matrix:", matrix_json)
+          print(f"Total planned jobs across all sites: {len(matrix_items)}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={matrix_json}\n")
           EOF
+
+      - name: Upload URL chunks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlr_url_chunks
+          path: url_chunks/*.txt
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Upload master URL lists artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlr_all_sitemap_urls
+          path: all_urls_*.txt
+          retention-days: 2
+          if-no-files-found: warn
 
   scrape:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    name: "Scrape (${{ matrix.site_key }} - offset ${{ matrix.offset }})"
+    name: "Scrape (${{ matrix.site_key }} - chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }} [${{ matrix.url_count }} URLs])"
     strategy:
       fail-fast: false
       matrix:
@@ -191,15 +346,25 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 curl_cffi cloudscraper
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
+
+      - name: Download URL chunks
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: dlr_url_chunks
+          path: url_chunks
 
       - name: Run scraper
         env:
           CURR_URL: ${{ matrix.url }}
           SITE_NAME: ${{ matrix.site_key }}
           SITEMAP_URL: ${{ matrix.sitemap_url }}
-          SITEMAP_OFFSET: ${{ matrix.offset }}
-          MAX_SITEMAPS: ${{ matrix.limit }}
+          URLS_FILE: ${{ matrix.chunk_file }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
+          TOTAL_CHUNKS: ${{ matrix.total_chunks }}
+          SITEMAP_OFFSET: ${{ matrix.chunk_index }}
+          MAX_SITEMAPS: 1
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
@@ -213,7 +378,9 @@ jobs:
           FTP_PATH: ${{ env.FTP_PATH }}
           FTP_SYNC_ITEMS: "100"
         run: |
-          python drl/dlr_scraper.py
+          echo "Starting scraper for ${{ matrix.site_key }} (chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }}):"
+          echo "URLS_FILE: ${{ matrix.chunk_file }} (${{ matrix.url_count }} URLs)"
+          python drl/dlr_scraper.py || echo "Scraper finished with exit code $?"
 
       - name: Rescue remaining chunk data to FTP on exit
         if: always()
@@ -225,6 +392,7 @@ jobs:
           FTP_PATH: ${{ env.FTP_PATH }}
           SITE_KEY: ${{ matrix.site_key }}
           COMPETITOR: ${{ matrix.competitor }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
         run: |
           python3 - << 'EOF'
           import os, glob, sys
@@ -245,8 +413,8 @@ jobs:
               print("No FTP configured, skipping rescue upload.")
               sys.exit(0)
 
-          csvs = glob.glob(f"products_{site_key}_chunk_*.csv") + glob.glob("products_*_chunk_*.csv")
-          txts = glob.glob(f"url_list_{site_key}_chunk_*.txt") + glob.glob("url_list_*_chunk_*.txt")
+          csvs = glob.glob(f"products_{site_key}_chunk_*.csv") + glob.glob("products_chunk_*.csv")
+          txts = glob.glob(f"url_list_{site_key}_chunk_*.txt") + glob.glob("url_list_chunk_*.txt")
 
           target_files = [f for f in set(csvs + txts) if os.path.exists(f) and os.path.getsize(f) > 0]
           if not target_files:
@@ -265,14 +433,16 @@ jobs:
           print("Rescue upload step complete.")
           EOF
 
-      - name: Upload chunk
-        if: always()
+      - name: Upload chunk (even on failure)
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: chunk_${{ matrix.site_key }}_${{ matrix.offset }}
+          name: chunk_${{ matrix.site_key }}_${{ matrix.chunk_index }}
           path: |
-            products_*.csv
-            url_list_*.txt
+            products_*_chunk_*.csv
+            products_chunk_*.csv
+            url_list_*_chunk_*.txt
+            url_list_chunk_*.txt
           if-no-files-found: warn
 
   merge:
@@ -296,6 +466,13 @@ jobs:
           path: chunks
           pattern: chunk_*
           merge-multiple: true
+
+      - name: Download master URL lists
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: dlr_all_sitemap_urls
+          path: master_urls
 
       - name: Process each site (Merge CSV, Track URLs, Prepare FTP)
         id: process_sites
@@ -342,19 +519,22 @@ jobs:
             fi
 
             # 2. Merge URL list
-            SITE_URLS=$(find chunks -name "url_list_${SITE}_chunk_*.txt" 2>/dev/null)
-            if [ -z "$SITE_URLS" ]; then
-              SITE_URLS=$(find chunks -name "url_list_chunk_*.txt" 2>/dev/null)
-            fi
-
             URL_FILE="all_sitemap_urls_${SITE}.txt"
-            if [ -n "$SITE_URLS" ]; then
-              cat $SITE_URLS | sort -u > "$URL_FILE"
-              URL_COUNT=$(wc -l < "$URL_FILE" | tr -d ' ')
-              echo "✓ Unique sitemap URLs for $SITE: $URL_COUNT"
+            if [ -f "master_urls/all_urls_${SITE}.txt" ]; then
+              cp "master_urls/all_urls_${SITE}.txt" "$URL_FILE"
             else
-              touch "$URL_FILE"
+              SITE_URLS=$(find chunks -name "url_list_${SITE}_chunk_*.txt" 2>/dev/null)
+              if [ -z "$SITE_URLS" ]; then
+                SITE_URLS=$(find chunks -name "url_list_chunk_*.txt" 2>/dev/null)
+              fi
+              if [ -n "$SITE_URLS" ]; then
+                cat $SITE_URLS | sort -u > "$URL_FILE"
+              else
+                touch "$URL_FILE"
+              fi
             fi
+            URL_COUNT=$(wc -l < "$URL_FILE" | tr -d ' ')
+            echo "✓ Unique sitemap URLs for $SITE: $URL_COUNT"
 
             # 3. Determine Competitor name for FTP
             case "$SITE" in

@@ -59,6 +59,10 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://www.overstock.com/api/product"
 SITEMAP_URL = os.getenv("SITEMAP_URL", "").strip()
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
+CHUNK_INDEX = int(os.getenv("CHUNK_INDEX", str(SITEMAP_OFFSET)))
+TOTAL_CHUNKS = int(os.getenv("TOTAL_CHUNKS", "0"))
+URLS_FILE = os.getenv("URLS_FILE", "").strip()
+COLLECT_URLS_ONLY = os.getenv("COLLECT_URLS_ONLY", "").strip().lower() in ("1", "true", "yes")
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
@@ -101,11 +105,12 @@ COMPETITOR_NAME = SITE_COMPETITORS.get(
 DATE_DIR = datetime.now(timezone.utc).strftime("%Y%m%d")
 REMOTE_TEMP_DIR = f"{FTP_PATH.rstrip('/')}/{COMPETITOR_NAME}/{DATE_DIR}/output/temp"
 
-OUTPUT_CSV = f"products_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.csv"
-URL_LIST_FILE = f"url_list_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.txt"
+OUTPUT_CSV = f"products_{SITE_NAME}_chunk_{CHUNK_INDEX}.csv"
+URL_LIST_FILE = f"url_list_{SITE_NAME}_chunk_{CHUNK_INDEX}.txt"
 REMOTE_TEMP_CSV = f"{REMOTE_TEMP_DIR}/{OUTPUT_CSV}"
 REMOTE_TEMP_URLS = f"{REMOTE_TEMP_DIR}/{URL_LIST_FILE}"
 SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+MASTER_URLS_FILE = os.getenv("MASTER_URLS_FILE", f"all_urls_{SITE_NAME}.txt").strip()
 
 # ================= LOGGER =================
 
@@ -823,6 +828,15 @@ def extract_product_data(product_data: dict) -> dict:
         if not sku and isinstance(product_data.get('product'), dict):
             sku = str(product_data['product'].get('sku', '')).strip()
 
+        # Resolve ROOM / HOST if present in SKU
+        if 'ROOM' in sku.upper() or 'HOST' in sku.upper():
+            for ec_item in ecommerce_items:
+                if isinstance(ec_item, dict):
+                    cand = str(ec_item.get('item_sku') or ec_item.get('sku') or '').strip()
+                    if cand and 'ROOM' not in cand.upper() and 'HOST' not in cand.upper():
+                        sku = cand
+                        break
+
         # ---------- Brand & Quantity ----------
         brand = ''
         quantity = 0
@@ -874,6 +888,9 @@ def extract_product_data(product_data: dict) -> dict:
                                 break
         except Exception as e:
             log(f"Error setting mpn or category : {e}", "DEBUG")
+
+        if ('ROOM' in sku.upper() or 'HOST' in sku.upper()) and mpn and 'ROOM' not in mpn.upper() and 'HOST' not in mpn.upper():
+            sku = mpn
 
         # ---------- Category from Ecommerce items ----------
         if ecommerce_items and isinstance(ecommerce_items[0], dict) and not category:
@@ -1053,19 +1070,130 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
     time.sleep(REQUEST_DELAY)
     stats['urls_processed'] += 1
 
+def collect_all_sitemap_urls(sitemap: Optional[str] = None, output_file: Optional[str] = None) -> List[str]:
+    """
+    Check all sitemaps, extract product counts per sitemap, log a breakdown,
+    and persist the complete list of unique product URLs to output_file.
+    """
+    if not sitemap:
+        sitemap = get_sitemap_url()
+
+    log("=" * 60)
+    log(f"DLR / {COMPETITOR_NAME} SITEMAP PRODUCT DISCOVERY & INVENTORY")
+    log(f"Base URL: {CURR_URL}")
+    log(f"Sitemap Index: {sitemap}")
+    log(f"FlareSolverr: {FLARESOLVERR_URL or 'None'}")
+    log("=" * 60)
+
+    if not sitemap:
+        log(f"ERROR: Could not locate a valid sitemap for {CURR_URL}.", "ERROR")
+        sys.exit(1)
+
+    index = load_xml(sitemap)
+    if index is None:
+        log("Failed to load sitemap index", "ERROR")
+        sys.exit(1)
+
+    ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    child_sitemaps = []
+
+    for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
+        elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
+        if elements:
+            child_sitemaps = [e.text.strip() for e in elements if e.text and "product" in e.text.lower()]
+            if child_sitemaps:
+                break
+
+    if not child_sitemaps:
+        url_elements = index.findall(".//ns:url/ns:loc", ns) if index.find(".//ns:url", ns) is not None else index.findall(".//url/loc")
+        if url_elements:
+            child_sitemaps = [sitemap]
+        else:
+            all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
+            child_sitemaps = all_locs if all_locs else [sitemap]
+
+    child_sitemaps = list(dict.fromkeys(child_sitemaps))
+    log(f"Discovered {len(child_sitemaps)} child sitemaps in index.")
+
+    sitemap_counts: Dict[str, int] = {}
+    all_urls: List[str] = []
+    lock = threading.Lock()
+
+    def process_child_sitemap(sm_url: str):
+        xml = load_xml(sm_url)
+        if not xml:
+            log(f"Failed to load child sitemap: {sm_url}", "WARNING")
+            with lock:
+                sitemap_counts[sm_url] = 0
+            return
+
+        urls = []
+        for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+            elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+            if elements:
+                urls = [
+                    e.text.strip()
+                    for e in elements
+                    if e.text
+                    and not any(ext in e.text.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.css', '.js'])
+                    and '.html' in e.text.lower()
+                ]
+                if urls:
+                    break
+
+        with lock:
+            sitemap_counts[sm_url] = len(urls)
+            all_urls.extend(urls)
+
+    fetch_workers = min(10, max(2, len(child_sitemaps)))
+    log(f"Checking {len(child_sitemaps)} child sitemaps with {fetch_workers} workers...")
+    with ThreadPoolExecutor(max_workers=fetch_workers) as executor:
+        futures = [executor.submit(process_child_sitemap, sm) for sm in child_sitemaps]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as ex:
+                log(f"Error processing child sitemap: {ex}", "ERROR")
+
+    unique_urls = list(dict.fromkeys(all_urls))
+
+    log("=" * 60)
+    log(f"{COMPETITOR_NAME} SITEMAP INVENTORY & PRODUCT COUNT SUMMARY")
+    log("=" * 60)
+    for idx, sm_url in enumerate(child_sitemaps, start=1):
+        count = sitemap_counts.get(sm_url, 0)
+        log(f"[{idx:02d}/{len(child_sitemaps):02d}] {sm_url} -> {count:,} product URLs")
+    log("-" * 60)
+    log(f"Total Sitemaps Checked: {len(child_sitemaps)}")
+    log(f"Total Discovered URLs: {len(all_urls):,}")
+    log(f"Total Unique Product URLs: {len(unique_urls):,}")
+    log("=" * 60)
+
+    target_file = output_file or MASTER_URLS_FILE
+    with open(target_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(unique_urls))
+    log(f"Saved {len(unique_urls):,} unique product URLs to {target_file}")
+
+    return unique_urls
+
 # ================= MAIN =================
 
 def main():
     sitemap = get_sitemap_url()
+
+    if COLLECT_URLS_ONLY or "--collect-urls" in sys.argv:
+        collect_all_sitemap_urls(sitemap=sitemap, output_file=MASTER_URLS_FILE)
+        sys.exit(0)
+
     log("=" * 60)
     log("Overstock / DRL Parallel Scraper")
     log(f"Timestamp: {SCRAPED_DATE}")
     log(f"Base URL: {CURR_URL}")
     log(f"API Base URL: {API_BASE_URL}")
-    log(f"Sitemap Index: {sitemap}")
-    log(f"Sitemap Offset: {SITEMAP_OFFSET}")
-    log(f"Max Sitemaps: {MAX_SITEMAPS if MAX_SITEMAPS > 0 else 'All'}")
-    log(f"Max URLs per Sitemap: {MAX_URLS_PER_SITEMAP if MAX_URLS_PER_SITEMAP > 0 else 'All'}")
+    log(f"Site Name: {SITE_NAME}")
+    log(f"Chunk Index: {CHUNK_INDEX}")
+    log(f"Total Chunks: {TOTAL_CHUNKS if TOTAL_CHUNKS > 0 else 'N/A'}")
+    log(f"URLs File: {URLS_FILE if URLS_FILE else 'None (Sitemap-driven)'}")
     log(f"Max Workers: {MAX_WORKERS}")
     log(f"Request Delay: {REQUEST_DELAY}s")
     log(f"curl_cffi Available: {HAS_CURL_CFFI}")
@@ -1073,63 +1201,112 @@ def main():
     log(f"FlareSolverr Configured: {FLARESOLVERR_URL or 'No'}")
     log(f"Proxy Configured: {'Yes' if PROXY_ENV else 'No (auto-detection)'}")
     log("=" * 60)
-    
-    if not sitemap:
-        log("=" * 60, "ERROR")
-        log(f"ERROR: Could not locate a valid sitemap for {CURR_URL}.", "ERROR")
-        log("The website may be protected by Cloudflare bot challenge/captcha.", "ERROR")
-        log("Please provide one of the following:", "ERROR")
-        log(" 1. Pass SITEMAP_URL directly via workflow inputs or environment variable.", "ERROR")
-        log(" 2. Provide a residential proxy via PROXY / HTTPS_PROXY secrets.", "ERROR")
-        log(" 3. Run FlareSolverr and pass FLARESOLVERR_URL.", "ERROR")
-        log("=" * 60, "ERROR")
-        sys.exit(1)
-    
-    # Load sitemap index
-    log(f"Loading sitemap index from {sitemap}")
-    index = load_xml(sitemap)
-    if index is None:
-        log("Failed to load sitemap index", "ERROR")
-        sys.exit(1)
-    
-    # Extract sitemap URLs
-    ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemaps = []
-    
-    # Try different XML structures
-    for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
-        elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
-        if elements:
-            sitemaps = [e.text.strip() for e in elements 
-            if e.text and "product" in e.text.lower()]
-            if sitemaps:
-                break
-    
-    # If no product sitemap found, check if sitemap is directly a urlset or has any sitemaps
-    if not sitemaps:
-        url_elements = index.findall(".//ns:url/ns:loc", ns) if index.find(".//ns:url", ns) is not None else index.findall(".//url/loc")
-        if url_elements:
-            log("Sitemap is a direct product URL set rather than an index")
-            sitemaps = [sitemap]
+
+    urls_to_process = []
+
+    # Mode 1: Pre-partitioned URL list (evenly balanced across runners)
+    if URLS_FILE and os.path.exists(URLS_FILE):
+        log(f"Loading pre-partitioned URLs from {URLS_FILE}")
+        with open(URLS_FILE, "r", encoding="utf-8") as uf:
+            urls_to_process = [line.strip() for line in uf if line.strip() and line.strip().startswith("http")]
+        log(f"Product URLs assigned to this chunk from {URLS_FILE}: {len(urls_to_process):,}")
+
+    # Mode 2: Legacy Sitemap-offset processing (fallback)
+    else:
+        if not sitemap:
+            log("=" * 60, "ERROR")
+            log(f"ERROR: Could not locate a valid sitemap for {CURR_URL}.", "ERROR")
+            log("The website may be protected by Cloudflare bot challenge/captcha.", "ERROR")
+            log("=" * 60, "ERROR")
+            sys.exit(1)
+
+        log(f"Loading sitemap index from {sitemap}")
+        index = load_xml(sitemap)
+        if index is None:
+            log("Failed to load sitemap index", "ERROR")
+            sys.exit(1)
+
+        ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        sitemaps = []
+
+        for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
+            elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
+            if elements:
+                sitemaps = [e.text.strip() for e in elements if e.text and "product" in e.text.lower()]
+                if sitemaps:
+                    break
+
+        if not sitemaps:
+            url_elements = index.findall(".//ns:url/ns:loc", ns) if index.find(".//ns:url", ns) is not None else index.findall(".//url/loc")
+            if url_elements:
+                sitemaps = [sitemap]
+            else:
+                all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
+                sitemaps = all_locs if all_locs else [sitemap]
+
+        discovered_urls = []
+        for sitemap_url in sitemaps:
+            log(f"Loading sitemap URLs from: {sitemap_url}")
+            xml = load_xml(sitemap_url)
+            if not xml:
+                continue
+            for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                if elements:
+                    sm_urls = [
+                        e.text.strip()
+                        for e in elements
+                        if e.text
+                        and not any(ext in e.text.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.css', '.js'])
+                        and '.html' in e.text.lower()
+                    ]
+                    if sm_urls:
+                        discovered_urls.extend(sm_urls)
+                        break
+
+        discovered_urls = list(dict.fromkeys(discovered_urls))
+        total_discovered = len(discovered_urls)
+        log(f"Total unique product URLs discovered across sitemaps: {total_discovered}")
+
+        if total_discovered == 0:
+            log("No product URLs found in any sitemap. Exiting.", "WARNING")
+            sys.exit(0)
+
+        if TOTAL_CHUNKS > 0:
+            chunk_size = (total_discovered + TOTAL_CHUNKS - 1) // TOTAL_CHUNKS
+            start_idx = CHUNK_INDEX * chunk_size
+            end_idx = min(start_idx + chunk_size, total_discovered)
+            if start_idx >= total_discovered:
+                log(f"Chunk {CHUNK_INDEX} out of range for {total_discovered} URLs. Exiting.", "WARNING")
+                sys.exit(0)
+            urls_to_process = discovered_urls[start_idx:end_idx]
+            log(f"URL Chunking Active: Chunk {CHUNK_INDEX + 1}/{TOTAL_CHUNKS} -> processing {len(urls_to_process)} URLs ({start_idx} to {end_idx} of {total_discovered})")
         else:
-            all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
-            sitemaps = all_locs if all_locs else [sitemap]
-    
-    # If still no sitemaps, try regex
-    if not sitemaps:
-        log("No sitemaps found with XML parsing, trying regex", "WARNING")
-    
-    # Apply offset and limit
-    if SITEMAP_OFFSET >= len(sitemaps):
-        log(f"Offset {SITEMAP_OFFSET} exceeds total sitemaps ({len(sitemaps)})", "WARNING")
-        sys.exit(0)
-    
-    end_index = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemaps)
-    sitemaps_to_process = sitemaps[SITEMAP_OFFSET:end_index]
-    
-    log(f"Total sitemaps found: {len(sitemaps)}")
-    log(f"Sitemaps to process: {len(sitemaps_to_process)}")
-    
+            if SITEMAP_OFFSET >= len(sitemaps):
+                log(f"Offset {SITEMAP_OFFSET} exceeds total sitemaps ({len(sitemaps)})", "WARNING")
+                sys.exit(0)
+            end_index = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemaps)
+            sitemaps_to_process = sitemaps[SITEMAP_OFFSET:end_index]
+            for sm_url in sitemaps_to_process:
+                xml = load_xml(sm_url)
+                if not xml:
+                    continue
+                for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                    elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                    if elements:
+                        sm_urls = [e.text.strip() for e in elements if e.text and '.html' in e.text.lower()]
+                        if sm_urls:
+                            urls_to_process.extend(sm_urls)
+                            break
+            urls_to_process = list(dict.fromkeys(urls_to_process))
+
+    if MAX_URLS_PER_SITEMAP > 0:
+        original_count = len(urls_to_process)
+        urls_to_process = urls_to_process[:MAX_URLS_PER_SITEMAP]
+        log(f"Limited to {len(urls_to_process)} out of {original_count} URLs")
+    else:
+        log(f"Product URLs assigned to this chunk: {len(urls_to_process)}")
+
     global csv_file_handle, uploader
 
     # Initialize periodic FTP streaming
@@ -1142,12 +1319,21 @@ def main():
     )
 
     stats = {
-        'sitemaps_processed': 0,
+        'sitemaps_processed': len(sitemaps),
         'urls_processed': 0,
         'products_fetched': 0,
         'errors': 0
     }
-    all_product_urls: list = []
+    all_product_urls: list = list(urls_to_process)
+
+    # Immediately persist assigned URLs and trigger initial sync
+    try:
+        with open(URL_LIST_FILE, "w", encoding="utf-8") as _uf:
+            _uf.write("\n".join(all_product_urls))
+        if uploader:
+            uploader.trigger_sync()
+    except Exception as _uex:
+        log(f"[URL-LIST] Early write note: {_uex}", "DEBUG")
 
     try:
         # Initialize CSV
@@ -1181,70 +1367,21 @@ def main():
             # Initialize tracking
             seen = set()
             
-            # Process each sitemap
-            for sitemap_url in sitemaps_to_process:
-                stats['sitemaps_processed'] += 1
-                log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
-                
-                # Load product sitemap - NO HEADERS for sitemap
-                xml = load_xml(sitemap_url)
-                if not xml:
-                    log(f"Failed to load sitemap: {sitemap_url}", "ERROR")
-                    continue
-                
-                # Extract product URLs
-                urls = []
-                for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
-                    elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
-                    if elements:
-                        urls = [
-                            e.text.strip()
-                            for e in elements
-                            if e.text
-                            and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
-                            and (
-                                '.html' in e.text
-                            )
-                        ]
-                        if urls:
-                            all_product_urls.extend(urls)
-                            # Immediately persist discovered URLs and trigger early sync
-                            try:
-                                with open(URL_LIST_FILE, "w", encoding="utf-8") as _uf:
-                                    _uf.write("\n".join(all_product_urls))
-                                if uploader:
-                                    uploader.trigger_sync()
-                            except Exception as _uex:
-                                log(f"[URL-LIST] Early write note: {_uex}", "DEBUG")
-                            break
-                
-                if not urls:
-                    log(f"No product URLs found in sitemap: {sitemap_url}", "WARNING")
-                    continue
-                
-                # Apply URL limit
-                if MAX_URLS_PER_SITEMAP > 0:
-                    original_count = len(urls)
-                    urls = urls[:MAX_URLS_PER_SITEMAP]
-                    log(f"Limited to {len(urls)} out of {original_count} URLs")
-                else:
-                    log(f"Found {len(urls)} product URLs in this sitemap")
-                
-                # Process URLs in parallel
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    futures = [
-                        executor.submit(process_product_data, url, writer, seen, stats)
-                        for url in urls
-                    ]
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            log(f"Error in thread execution: {e}", "ERROR")
-                            stats['errors'] += 1
-                
-                # Clean up memory
-                gc.collect()
+            # Process URLs in parallel
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(process_product_data, url, writer, seen, stats)
+                    for url in urls_to_process
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        log(f"Error in thread execution: {e}", "ERROR")
+                        stats['errors'] += 1
+            
+            # Clean up memory
+            gc.collect()
     finally:
         # Guarantee that whatever data was scraped is pushed to FTP before exiting
         if uploader:
