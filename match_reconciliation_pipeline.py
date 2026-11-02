@@ -139,6 +139,24 @@ def id_tokens(value: Any) -> list[str]:
     return tokens
 
 
+def clean_hyphen_token(val: Any) -> str:
+    s = str(val or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\-]+", "-", s)
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def hyphen_id_tokens(value: Any) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for part in split_multi_values(value):
+        token = clean_hyphen_token(part)
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return tokens
+
+
 def numeric_tokens(value: Any) -> list[str]:
     tokens: list[str] = []
     seen: set[str] = set()
@@ -494,26 +512,99 @@ def is_strong_id_token(token: str) -> bool:
     return any(c.isdigit() for c in token)
 
 
-def partial_token_match(left: str, right: str) -> bool:
-    # Normalize by removing all non-alphanumeric characters on both sides
-    left_n = re.sub(r"[^a-z0-9]+", "", clean_text(left).lower())
-    right_n = re.sub(r"[^a-z0-9]+", "", clean_text(right).lower())
+def is_prefix_suffix_match(left_raw: str, right_raw: str) -> bool:
+    """Strict prefix/suffix and multi-part SKU matching.
 
-    if not left_n or not right_n:
+    Rules:
+    1. Delimiter requirement: Differences must be separated by a hyphen (-).
+       No matching when difference is a direct concatenation without hyphen (e.g. ASL-92101S1 vs ASL-92101S10).
+    2. ROOM / HOST: If ROOM or HOST is present on one side and not the other, it cannot match a single product.
+    3. Multi-part combination SKUs (e.g. ASL-9221-648-649-650 vs ASL-9221-648-649-650-W101-10):
+       All digit-bearing parts must match symmetrically. Extra/missing part codes cause a mismatch.
+    4. Suffix/prefix contents: Extra suffix after hyphen must be an alphabetic variant code (e.g. -ABC, -BLK),
+       not a part number with digits.
+    """
+    l_h = clean_hyphen_token(left_raw)
+    r_h = clean_hyphen_token(right_raw)
+    if not l_h or not r_h:
         return False
 
-    # Exact match after normalization
-    if left_n == right_n:
+    # Exact match (with or without hyphens)
+    if l_h == r_h or norm_id(l_h) == norm_id(r_h):
         return True
 
-    # Bi-directional partial containment (no min length restriction)
-    # Example:
-    # ABCXYZ vs XYZ
-    # PQA vs MNPPQA
-    if left_n in right_n or right_n in left_n:
+    l_parts = [p for p in l_h.split("-") if p]
+    r_parts = [p for p in r_h.split("-") if p]
+
+    # Rule 1: ROOM / HOST check
+    l_has_host_room = any(p in {"room", "host"} for p in l_parts)
+    r_has_host_room = any(p in {"room", "host"} for p in r_parts)
+    if l_has_host_room != r_has_host_room:
+        return False
+
+    # Strip brand / vendor leading prefixes (e.g. ['cf', 'asl', '92101s1'] -> ['92101s1'])
+    def strip_brand_prefix(parts: list[str]) -> list[str]:
+        idx = 0
+        while idx < len(parts) - 1 and parts[idx].isalpha() and any(any(c.isdigit() for c in p) for p in parts[idx + 1 :]):
+            idx += 1
+        return parts[idx:]
+
+    l_core = strip_brand_prefix(l_parts)
+    r_core = strip_brand_prefix(r_parts)
+
+    if l_core == r_core or norm_id("".join(l_core)) == norm_id("".join(r_core)):
         return True
+
+    # Rule 3: Multi-part combination check
+    l_digits = [p for p in l_core if any(c.isdigit() for c in p)]
+    r_digits = [p for p in r_core if any(c.isdigit() for c in p)]
+
+    if len(l_digits) >= 2 or len(r_digits) >= 2:
+        # Multi-part combinations: all part numbers with digits must match symmetrically
+        if sorted(l_digits) != sorted(r_digits):
+            return False
+        non_digits = set(l_core + r_core) - set(l_digits)
+        if any(p in {"room", "host"} for p in non_digits):
+            return False
+        return True
+
+    # Single-item comparison: prefix or suffix must be separated by hyphen (-)
+    l_c_str = "-".join(l_core)
+    r_c_str = "-".join(r_core)
+
+    shorter_str, longer_str = (l_c_str, r_c_str) if len(norm_id(l_c_str)) <= len(norm_id(r_c_str)) else (r_c_str, l_c_str)
+
+    # Prefix match: longer = shorter + '-' + extra
+    if longer_str.startswith(shorter_str + "-"):
+        extra = longer_str[len(shorter_str) + 1 :]
+        extra_parts = [p for p in extra.split("-") if p]
+        if any(p in {"room", "host"} for p in extra_parts):
+            return False
+        # If extra contains digits, it is an extra part number / different product (e.g. -01, -10, -W101-10)
+        if any(any(c.isdigit() for c in p) for p in extra_parts):
+            return False
+        # Suffix must be alphabetic variant code (e.g. 'abc', 'blk', 'gry')
+        if all(p.isalpha() for p in extra_parts):
+            return True
+        return False
+
+    # Suffix match: longer = extra + '-' + shorter
+    if longer_str.endswith("-" + shorter_str):
+        extra = longer_str[: -len(shorter_str) - 1]
+        extra_parts = [p for p in extra.split("-") if p]
+        if any(p in {"room", "host"} for p in extra_parts):
+            return False
+        if any(any(c.isdigit() for c in p) for p in extra_parts):
+            return False
+        if all(p.isalpha() for p in extra_parts):
+            return True
+        return False
 
     return False
+
+
+def partial_token_match(left: str, right: str) -> bool:
+    return is_prefix_suffix_match(left, right)
 
 
 def all_tokens_exact(left_tokens: list[str], right_tokens: list[str] | set[str]) -> bool:
@@ -761,6 +852,14 @@ class ReconciliationPipeline:
                 mpn_merged_token = norm_id(mpn_merged)
                 if mpn_merged_token and mpn_merged_token not in mpn_tokens:
                     mpn_tokens.append(mpn_merged_token)
+
+                mpn_hyphen_tokens = hyphen_id_tokens(row.get("mpn"))
+                sku_hyphen_tokens = hyphen_id_tokens(row.get("sku"))
+                part_hyphen_tokens = hyphen_id_tokens(row.get("part_number"))
+                mpn_merged_hyphen = clean_hyphen_token(mpn_merged)
+                if mpn_merged_hyphen and mpn_merged_hyphen not in mpn_hyphen_tokens:
+                    mpn_hyphen_tokens.append(mpn_merged_hyphen)
+
                 id_union = list(dict.fromkeys(mpn_tokens + sku_tokens + part_tokens))
                 search_id_tokens = list(dict.fromkeys((mpn_tokens + sku_tokens) if (mpn_tokens or sku_tokens) else part_tokens))
                 gtin_values = numeric_tokens(row.get("gtin"))
@@ -796,6 +895,9 @@ class ReconciliationPipeline:
                     "_mpn_tokens": mpn_tokens,
                     "_sku_tokens": sku_tokens,
                     "_part_tokens": part_tokens,
+                    "_mpn_hyphen_tokens": mpn_hyphen_tokens,
+                    "_sku_hyphen_tokens": sku_hyphen_tokens,
+                    "_part_hyphen_tokens": part_hyphen_tokens,
                     "_id_tokens": id_union,
                     "_search_id_tokens": search_id_tokens,
                     "_id_token_set": set(id_union),
@@ -867,8 +969,13 @@ class ReconciliationPipeline:
                 ref_gtin = clean.get("Ref GTIN", "")
                 brand_label = clean.get(self.scrape_brand_col, "")
                 ref_category = clean.get("Ref Category", "")
-                ref_name = clean.get("Ref Product Name", "")
                 mpn_tokens = id_tokens(ref_mpn)
+                comp_mpn_hyphen = hyphen_id_tokens(ref_mpn)
+                ref_sku_val = clean.get("Ref SKU", "")
+                if ref_sku_val:
+                    for t in hyphen_id_tokens(ref_sku_val):
+                        if t not in comp_mpn_hyphen:
+                            comp_mpn_hyphen.append(t)
                 gtin_values = numeric_tokens(ref_gtin)
 
                 parsed = {
@@ -889,6 +996,7 @@ class ReconciliationPipeline:
                     "_category_tokens": token_set(ref_category),
                     "_name_tokens": list(tokenize_text(ref_name)),
                     "_mpn_tokens": mpn_tokens,
+                    "_mpn_hyphen_tokens": comp_mpn_hyphen,
                     "_mpn_token_set": set(mpn_tokens),
                     "_gtin_tokens": gtin_values,
                     "_gtin_set": set(gtin_values),
@@ -1070,10 +1178,10 @@ class ReconciliationPipeline:
             flags["gtin_match"] = True
             reasons.append("GTIN exact (all values)")
 
-        comp_mpn_tokens = row["_mpn_tokens"]
-        mpn_tokens = sys_row["_mpn_tokens"]
-        sku_tokens = sys_row["_sku_tokens"]
-        part_tokens = sys_row["_part_tokens"]
+        comp_mpn_tokens = row.get("_mpn_hyphen_tokens") or row.get("_mpn_tokens", [])
+        mpn_tokens = sys_row.get("_mpn_hyphen_tokens") or sys_row.get("_mpn_tokens", [])
+        sku_tokens = sys_row.get("_sku_hyphen_tokens") or sys_row.get("_sku_tokens", [])
+        part_tokens = sys_row.get("_part_hyphen_tokens") or sys_row.get("_part_tokens", [])
 
         if comp_mpn_tokens:
             flags["mpn_exact_all"] = False
@@ -1084,21 +1192,24 @@ class ReconciliationPipeline:
                 if not left_tokens or not right_tokens:
                     return False
 
-                left_norm = [norm_id(t) for t in left_tokens if norm_id(t)]
-                right_norm = [norm_id(t) for t in right_tokens if norm_id(t)]
+                if not partial:
+                    left_norm = [norm_id(t) for t in left_tokens if norm_id(t)]
+                    right_norm = [norm_id(t) for t in right_tokens if norm_id(t)]
 
-                if not left_norm or not right_norm:
-                    return False
+                    if not left_norm or not right_norm:
+                        return False
 
-                for l in left_norm:
-                    for r in right_norm:
-                        if not partial:
+                    for l in left_norm:
+                        for r in right_norm:
                             if l == r:
                                 return True
-                        else:
-                            if l in r or r in l:
+                    return False
+                else:
+                    for l in left_tokens:
+                        for r in right_tokens:
+                            if is_prefix_suffix_match(l, r):
                                 return True
-                return False
+                    return False
 
             # Priority 1: MPN
             if mpn_tokens:
@@ -1239,6 +1350,22 @@ class ReconciliationPipeline:
             flags["set_mismatch"] = True
             score -= 200
             reasons.append("Set mismatch (URL suggests set)")
+
+        # ROOM / HOST mismatch check (whole set vs single piece)
+        comp_has_room_host = any(
+            p in {"room", "host"}
+            for t in comp_mpn_tokens
+            for p in clean_hyphen_token(t).split("-")
+        )
+        sys_has_room_host = any(
+            p in {"room", "host"}
+            for t in (mpn_tokens + sku_tokens + part_tokens)
+            for p in clean_hyphen_token(t).split("-")
+        )
+        if comp_has_room_host != sys_has_room_host:
+            flags["set_mismatch"] = True
+            score -= 200
+            reasons.append("Set mismatch (ROOM/HOST set vs single product)")
 
         # Bed part mismatch (headboard/footboard/rails)
         has_with_token = bool(row.get("_url_contains_with")) or any(t in {"with", "w", "bench"} for t in url_tokens)

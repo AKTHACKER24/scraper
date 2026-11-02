@@ -333,6 +333,20 @@ class unlimitedFurnitureScraper:
         # SKU, MPN, GTIN
         sku = str(product_obj.get("sku", "") or "").strip()
         mpn = str(product_obj.get("mpn", "") or sku).strip()
+
+        # If SKU has ROOM or HOST, resolve to variant SKU if available
+        if 'ROOM' in sku.upper() or 'HOST' in sku.upper():
+            variants = product_obj.get("hasVariant", [])
+            if isinstance(variants, list):
+                for var in variants:
+                    if isinstance(var, dict):
+                        cand = str(var.get("sku") or var.get("mpn") or "").strip()
+                        if cand and 'ROOM' not in cand.upper() and 'HOST' not in cand.upper():
+                            sku = cand
+                            mpn = str(var.get("mpn") or sku).strip()
+                            break
+            if ('ROOM' in sku.upper() or 'HOST' in sku.upper()) and mpn and 'ROOM' not in mpn.upper() and 'HOST' not in mpn.upper():
+                sku = mpn
         gtin = str(
             product_obj.get("gtin13")
             or product_obj.get("gtin")
