@@ -406,56 +406,7 @@ class BypassSession:
         if not url or not isinstance(url, str) or not url.startswith("http"):
             return None
 
-        # If we have clearance cookies from FlareSolverr, first try fast direct requests
-        if self.clearance_cookies.get("cf_clearance"):
-            proxies = self._get_proxies_dict()
-            headers = dict(self.browser_headers)
-            if is_json:
-                headers.update({
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{CURR_URL}/",
-                })
-
-            # Fast Strategy 1: curl_cffi with clearance cookies & Chrome TLS impersonation
-            if HAS_CURL_CFFI:
-                try:
-                    resp = cc_requests.get(
-                        url,
-                        headers=headers,
-                        cookies=self.clearance_cookies,
-                        impersonate="chrome124",
-                        proxies=proxies,
-                        timeout=20,
-                        verify=False
-                    )
-                    if resp.status_code == 200 and not self._is_challenge(resp.text):
-                        log(f"Fast curl_cffi request succeeded for {url} using cf_clearance", "DEBUG")
-                        return resp.text
-                    elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
-                        log(f"cf_clearance cookie expired/blocked (status {resp.status_code}), refreshing via FlareSolverr...", "WARNING")
-                        self.clearance_cookies.pop("cf_clearance", None)
-                except Exception as e:
-                    log(f"Fast curl_cffi request failed: {e}", "DEBUG")
-
-            # Fast Strategy 2: requests.Session with clearance cookies
-            try:
-                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
-                if resp.status_code == 200 and not self._is_challenge(resp.text):
-                    log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
-                    return resp.text
-                elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
-                    self.clearance_cookies.pop("cf_clearance", None)
-            except Exception as e:
-                log(f"Fast direct session request failed: {e}", "DEBUG")
-
-        # If FlareSolverr is configured, use it with generous timeout (e.g. 90-120s for sitemaps)
-        if FLARESOLVERR_URL:
-            fs_timeout = max(timeout, FLARESOLVERR_TIMEOUT)
-            content = self._fetch_flaresolverr(url, timeout=fs_timeout)
-            if content:
-                return content
-
+        proxies = self._get_proxies_dict()
         headers = dict(self.browser_headers)
         if is_json:
             headers.update({
@@ -466,6 +417,50 @@ class BypassSession:
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",
             })
+
+        # Fast Strategy 1: Direct curl_cffi with Chrome TLS impersonation (with or without cf_clearance)
+        if HAS_CURL_CFFI:
+            for imp in ["chrome124", "chrome120"]:
+                try:
+                    resp = cc_requests.get(
+                        url,
+                        headers=headers,
+                        cookies=self.clearance_cookies,
+                        impersonate=imp,
+                        proxies=proxies,
+                        timeout=timeout,
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        log(f"Fast direct curl_cffi ({imp}) request succeeded for {url}", "DEBUG")
+                        return resp.text
+                    elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
+                        log(f"curl_cffi ({imp}) challenged/blocked on {url}", "DEBUG")
+                        if "cf_clearance" in self.clearance_cookies:
+                            self.clearance_cookies.pop("cf_clearance", None)
+                        break
+                except Exception as e:
+                    log(f"curl_cffi ({imp}) error for {url}: {e}", "DEBUG")
+
+        # Fast Strategy 2: If we have clearance cookies, try requests.Session
+        if self.clearance_cookies.get("cf_clearance"):
+            try:
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
+                if resp.status_code == 200 and not self._is_challenge(resp.text):
+                    log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
+                    return resp.text
+                elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
+                    self.clearance_cookies.pop("cf_clearance", None)
+            except Exception as e:
+                log(f"Fast direct session request failed: {e}", "DEBUG")
+
+        # Fallback Strategy: If FlareSolverr is configured and direct request was blocked or failed
+        if FLARESOLVERR_URL:
+            fs_timeout = max(timeout, FLARESOLVERR_TIMEOUT)
+            content = self._fetch_flaresolverr(url, timeout=fs_timeout)
+            if content:
+                return content
 
         for attempt in range(max_retries):
             proxies = self._get_proxies_dict()
@@ -703,17 +698,99 @@ def fetch_json(url: str) -> Optional[dict]:
 
 # ================= SITEMAP PROCESSING =================
 
-def load_xml(url: str) -> Optional[ET.Element]:
-    """Load XML sitemap with appropriate anti-bot headers and retry logic"""
+def _is_likely_sitemap_xml(text: Optional[str]) -> bool:
+    """Check if the response text contains recognizable sitemap or XML indicators."""
+    if not text or not isinstance(text, str):
+        return False
+    lower = text.lower()
+    return any(marker in lower for marker in [
+        "<loc", "&lt;loc",
+        "<sitemap", "&lt;sitemap",
+        "<urlset", "&lt;urlset",
+        "<sitemapindex", "&lt;sitemapindex",
+        "webkit-xml-viewer",
+        ".xml",
+        "<?xml", "&lt;?xml",
+        "<url", "&lt;url",
+    ])
+
+def load_xml(url: str, max_retries: int = 3) -> Optional[ET.Element]:
+    """Load XML sitemap with fast direct curl_cffi first, FlareSolverr fallback, and regex parsing"""
     if not url or not isinstance(url, str):
         log(f"Invalid sitemap URL passed to load_xml: {url}", "ERROR")
         return None
 
-    data = bypass_session.fetch(url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
+    candidate_urls = [url]
+    if "://www." in url:
+        candidate_urls.append(url.replace("://www.", "://"))
+    elif "://" in url:
+        candidate_urls.append(url.replace("://", "://www."))
+
+    data = None
+    for target_url in candidate_urls:
+        for attempt in range(max_retries):
+            # Step 1: Direct curl_cffi attempt
+            if HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        target_url,
+                        headers=dict(bypass_session.browser_headers),
+                        cookies=bypass_session.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=bypass_session._get_proxies_dict(),
+                        timeout=30,
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    if resp.status_code == 200 and not bypass_session._is_challenge(resp.text) and _is_likely_sitemap_xml(resp.text):
+                        log(f"Direct curl_cffi successfully loaded XML from {target_url} ({len(resp.text):,} bytes)", "DEBUG")
+                        data = resp.text
+                        url = target_url
+                        break
+                except Exception as e:
+                    log(f"Direct curl_cffi error for {target_url}: {e}", "DEBUG")
+
+            # Step 2: Use bypass_session.fetch (invoking FlareSolverr if direct request was challenged)
+            if not data:
+                data = bypass_session.fetch(target_url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
+
+            # Step 3: If FlareSolverr obtained cf_clearance, retry raw XML download via curl_cffi
+            if (not data or not _is_likely_sitemap_xml(data)) and bypass_session.clearance_cookies.get("cf_clearance") and HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        target_url,
+                        headers=dict(bypass_session.browser_headers),
+                        cookies=bypass_session.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=bypass_session._get_proxies_dict(),
+                        timeout=30,
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    if resp.status_code == 200 and not bypass_session._is_challenge(resp.text) and _is_likely_sitemap_xml(resp.text):
+                        log(f"curl_cffi with fresh cf_clearance loaded XML from {target_url} ({len(resp.text):,} bytes)", "DEBUG")
+                        data = resp.text
+                        url = target_url
+                        break
+                except Exception:
+                    pass
+
+            if _is_likely_sitemap_xml(data):
+                url = target_url
+                break
+
+            log(f"Sitemap data from {target_url} missing XML content, retrying...", "WARNING")
+            bypass_session.flaresolverr_session_id = None
+            time.sleep(2 * (attempt + 1))
+
+        if _is_likely_sitemap_xml(data):
+            break
+
     if not data:
         log(f"Failed to load XML from {url}", "ERROR")
         return None
-        
+
+    raw_data = data
     try:
         # Check if Chrome wrapped XML in an HTML viewer (common with FlareSolverr)
         if '<div id="webkit-xml-viewer-source-xml"' in data:
@@ -729,27 +806,57 @@ def load_xml(url: str) -> Optional[ET.Element]:
         if "&lt;" in data and "&gt;" in data:
             data = html.unescape(data)
 
-        # Clean XML declaration if needed
-        if "<?xml" not in data[:100] and not data.strip().startswith("<"):
-            data = '<?xml version="1.0" encoding="UTF-8"?>\n' + data
+        # Remove default XML namespace to make queries simple and direct
+        data_clean = re.sub(r'\sxmlns="[^"]+"', '', data, count=1)
 
-        return ET.fromstring(data)
-    except ET.ParseError as e:
+        # Trim any HTML envelope before XML root
+        start_idx = data_clean.find("<?xml")
+        if start_idx == -1:
+            start_idx = data_clean.find("<sitemapindex")
+        if start_idx == -1:
+            start_idx = data_clean.find("<urlset")
+        if start_idx != -1:
+            data_clean = data_clean[start_idx:]
+
+        # Trim any trailing content after root closing tag
+        for close_tag in ["</sitemapindex>", "</urlset>"]:
+            end_idx = data_clean.rfind(close_tag)
+            if end_idx != -1:
+                data_clean = data_clean[:end_idx + len(close_tag)]
+                break
+
+        # Clean XML declaration if needed
+        if "<?xml" not in data_clean[:100] and not data_clean.strip().startswith("<"):
+            data_clean = '<?xml version="1.0" encoding="UTF-8"?>\n' + data_clean
+
+        try:
+            import lxml.etree as letree
+            return letree.fromstring(data_clean.encode('utf-8'))
+        except Exception:
+            return ET.fromstring(data_clean)
+
+    except Exception as e:
         log(f"XML parsing failed for {url}: {e}, attempting regex extraction", "WARNING")
         # Try to extract URLs with regex
         try:
-            root = ET.Element("urlset")
-            clean_text = html.unescape(data)
+            clean_text = html.unescape(raw_data)
             urls = re.findall(r'<loc[^>]*>\s*(https?://[^<\s]+)\s*</loc>', clean_text, re.IGNORECASE)
             if not urls:
-                # Fallback: find any valid http URLs ending with .xml or .html
-                urls = re.findall(r'https?://[^\s<"\'\\]+\.(?:xml|html)', clean_text)
+                urls = re.findall(r'href=["\'](https?://[^"\'\s]+\.xml)["\']', clean_text, re.IGNORECASE)
+            if not urls:
+                urls = re.findall(r'https?://[^\s<"\'\\]+sitemap[^\s<"\'\\]*\.xml', clean_text, re.IGNORECASE)
+            if not urls:
+                urls = re.findall(r'https?://[^\s<"\'\\]+\.(?:xml|html)', clean_text, re.IGNORECASE)
             if not urls:
                 log("Regex extraction found no valid URLs in sitemap data", "ERROR")
                 return None
+
+            urls = list(dict.fromkeys(u.strip() for u in urls if u and u.strip()))
+            is_index = any(".xml" in u.lower() for u in urls)
+            root = ET.Element("sitemapindex" if is_index else "urlset")
             for url_text in urls:
-                url_elem = ET.SubElement(root, "url")
-                loc_elem = ET.SubElement(url_elem, "loc")
+                sub_elem = ET.SubElement(root, "sitemap" if is_index else "url")
+                loc_elem = ET.SubElement(sub_elem, "loc")
                 loc_elem.text = url_text.strip()
             log(f"Regex extraction successfully found {len(urls)} URLs in {url}")
             return root
