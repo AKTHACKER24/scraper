@@ -38,9 +38,9 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      matrix: ${{ steps.build_matrix.outputs.matrix }}
       site_name: ${{ steps.get_site_name.outputs.site_name }}
-      has_url_chunks: ${{ steps.matrix.outputs.has_url_chunks }}
+      has_url_chunks: ${{ steps.build_matrix.outputs.has_url_chunks }}
     steps:
       - name: Extract site name from URL
         id: get_site_name
@@ -50,32 +50,25 @@ jobs:
           echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
           echo "Site name: $SITE_NAME"
 
-      - name: Build job matrix
-        id: matrix
+      - name: Fetch unscraped URLs from FTP (Resume Mode)
+        id: fetch_ftp
+        if: ${{ github.event.inputs.resume_unscraped_only != 'false' && github.event.inputs.resume_unscraped_only != '' }}
         env:
-          BASE_URL: ${{ github.event.inputs.url }}
-          RESUME_UNSCRAPED_ONLY: ${{ github.event.inputs.resume_unscraped_only != 'false' && github.event.inputs.resume_unscraped_only != '' }}
           URLS_PER_RUNNER: ${{ github.event.inputs.urls_per_runner }}
           MAX_RUNNERS: ${{ github.event.inputs.max_runners }}
-          TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
-          PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_PORT: ${{ secrets.FTP_PORT || '21' }}
-          FTP_PATH: ${{ secrets.FTP_PATH || '/scrap' }}
+          FTP_PORT: "21"
+          FTP_PATH: "/scrap"
         run: |
           python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
           import os
-          import json
           import math
-          import urllib.request
-          import re
-          import sys
-          from xml.etree import ElementTree as ET
+          import ftplib
+          import io
+          import csv
 
-          url = os.environ.get("BASE_URL", "https://www.unlimitedfurnituregroup.com").rstrip("/")
-          resume_unscraped = os.environ.get("RESUME_UNSCRAPED_ONLY", "false").lower() in ("true", "1", "yes")
           urls_per_runner = int(os.environ.get("URLS_PER_RUNNER", "350") or "350")
           max_runners = int(os.environ.get("MAX_RUNNERS", "120") or "120")
           ftp_host = os.environ.get("FTP_HOST", "").strip()
@@ -84,81 +77,89 @@ jobs:
           ftp_port = int(os.environ.get("FTP_PORT", "21") or "21")
           ftp_path = os.environ.get("FTP_PATH", "/scrap").rstrip("/")
 
-          # -------------------------------------------------------------
-          # MODE 1: RESUME UNSCRAPED URLS ONLY FROM FTP TRACKING FILE
-          # -------------------------------------------------------------
-          if resume_unscraped:
-              if not (ftp_host and ftp_user and ftp_pass):
-                  print("Warning: FTP secrets not configured. Cannot run resume mode. Falling back to sitemap.")
-              else:
-                  import ftplib, io, csv
-                  print(f"Connecting to FTP ({ftp_host}) to locate latest FinalURLListForScrap tracking CSV...")
-                  try:
-                      ftp = ftplib.FTP()
-                      ftp.connect(ftp_host, ftp_port, timeout=30)
-                      ftp.login(ftp_user, ftp_pass)
-                      comp_dir = f"{ftp_path}/Unlimitedfurniture"
-                      date_dirs = sorted([d for d in ftp.nlst(comp_dir) if d.split('/')[-1].isdigit()])
-                      unscraped_urls = []
-                      if date_dirs:
-                          for d in reversed(date_dirs):
-                              out_dir = f"{d}/output"
-                              try:
-                                  files = ftp.nlst(out_dir)
-                                  finals = [f for f in files if "FinalURLList" in f and f.endswith(".csv")]
-                                  if finals:
-                                      latest_final = sorted(finals)[-1]
-                                      print(f"Reading tracking file: {latest_final}")
-                                      bio = io.BytesIO()
-                                      ftp.retrbinary(f"RETR {latest_final}", bio.write)
-                                      bio.seek(0)
-                                      reader = csv.reader(io.StringIO(bio.getvalue().decode('utf-8', errors='ignore')))
-                                      for row in reader:
-                                          if len(row) >= 2 and row[1].strip().lower() == "not scraped":
-                                              u = row[0].strip()
-                                              # Exclude obvious non-product category / PLP paths
-                                              path = u.split("unlimitedfurnituregroup.com/")[-1].strip("/")
-                                              if path.endswith(".html") and "/" not in path:
-                                                  unscraped_urls.append(u)
-                                      if unscraped_urls:
-                                          print(f"Found {len(unscraped_urls):,} 'Not Scraped' candidate products in {latest_final}")
-                                          break
-                              except Exception as e_inner:
-                                  print(f"Note: {e_inner}")
-                      ftp.quit()
+          if not (ftp_host and ftp_user and ftp_pass):
+              print("Warning: FTP secrets not configured.")
+              sys.exit(0)
 
-                      if unscraped_urls:
-                          os.makedirs("url_chunks", exist_ok=True)
-                          total_needed = (len(unscraped_urls) + urls_per_runner - 1) // urls_per_runner
-                          num_chunks = min(total_needed, max_runners, 250)
-                          chunk_size = math.ceil(len(unscraped_urls) / num_chunks)
-                          matrix = []
-                          for i in range(num_chunks):
-                              c_urls = unscraped_urls[i * chunk_size : (i + 1) * chunk_size]
-                              c_file = f"url_chunks/chunk_{i}.txt"
-                              with open(c_file, "w", encoding="utf-8") as f_out:
-                                  f_out.write("\n".join(c_urls) + "\n")
-                              matrix.append({
-                                  "chunk_id": str(i),
-                                  "urls_file": c_file,
-                                  "offset": i,
-                                  "limit": 0,
-                                  "url": url
-                              })
+          print(f"Connecting to FTP ({ftp_host}) to locate latest FinalURLListForScrap tracking CSV...")
+          try:
+              ftp = ftplib.FTP()
+              ftp.connect(ftp_host, ftp_port, timeout=30)
+              ftp.login(ftp_user, ftp_pass)
+              comp_dir = f"{ftp_path}/Unlimitedfurniture"
+              date_dirs = sorted([d for d in ftp.nlst(comp_dir) if d.split('/')[-1].isdigit()])
+              unscraped_urls = []
+              if date_dirs:
+                  for d in reversed(date_dirs):
+                      out_dir = f"{d}/output"
+                      try:
+                          files = ftp.nlst(out_dir)
+                          finals = [f for f in files if "FinalURLList" in f and f.endswith(".csv")]
+                          if finals:
+                              latest_final = sorted(finals)[-1]
+                              print(f"Reading tracking file: {latest_final}")
+                              bio = io.BytesIO()
+                              ftp.retrbinary(f"RETR {latest_final}", bio.write)
+                              bio.seek(0)
+                              reader = csv.reader(io.StringIO(bio.getvalue().decode('utf-8', errors='ignore')))
+                              for row in reader:
+                                  if len(row) >= 2 and row[1].strip().lower() == "not scraped":
+                                      u = row[0].strip()
+                                      path = u.split("unlimitedfurnituregroup.com/")[-1].strip("/")
+                                      if path.endswith(".html") and "/" not in path:
+                                          unscraped_urls.append(u)
+                              if unscraped_urls:
+                                  print(f"Found {len(unscraped_urls):,} 'Not Scraped' candidate products in {latest_final}")
+                                  break
+                      except Exception as e_inner:
+                          print(f"Note: {e_inner}")
+              ftp.quit()
 
-                          print(f"Planned {len(matrix)} resume runners for {len(unscraped_urls):,} URLs (~{chunk_size} URLs/runner)")
-                          with open(os.environ["GITHUB_OUTPUT"], "a") as f_out:
-                              f_out.write(f"matrix={json.dumps(matrix)}\n")
-                              f_out.write("has_url_chunks=true\n")
-                          sys.exit(0)
-                      else:
-                          print("No unscraped candidate products found in latest FTP tracking files.")
-                  except Exception as ex_ftp:
-                      print(f"FTP Resume check error: {ex_ftp}. Falling back to sitemap discovery.")
+              if unscraped_urls:
+                  os.makedirs("url_chunks", exist_ok=True)
+                  total_needed = (len(unscraped_urls) + urls_per_runner - 1) // urls_per_runner
+                  num_chunks = min(total_needed, max_runners, 250)
+                  chunk_size = math.ceil(len(unscraped_urls) / num_chunks)
+                  for i in range(num_chunks):
+                      c_urls = unscraped_urls[i * chunk_size : (i + 1) * chunk_size]
+                      c_file = f"url_chunks/chunk_{i}.txt"
+                      with open(c_file, "w", encoding="utf-8") as f_out:
+                          f_out.write("\n".join(c_urls) + "\n")
+                  with open("url_chunks/count.txt", "w") as f_cnt:
+                      f_cnt.write(str(num_chunks))
+                  print(f"Saved {num_chunks} chunk files into url_chunks/ (~{chunk_size} URLs/runner)")
+          except Exception as ex_ftp:
+              print(f"FTP Resume check error: {ex_ftp}")
+          EOF
 
-          # -------------------------------------------------------------
-          # MODE 2: SITEMAP-DRIVEN SCRAPING
-          # -------------------------------------------------------------
+      - name: Build clean runner matrix
+        id: build_matrix
+        env:
+          BASE_URL: ${{ github.event.inputs.url }}
+          TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
+          PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
+        run: |
+          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
+          import os
+          import json
+          import glob
+          import urllib.request
+          import re
+          from xml.etree import ElementTree as ET
+
+          # Check if url_chunks exist from Resume Mode
+          chunk_files = sorted(glob.glob("url_chunks/chunk_*.txt"))
+          if chunk_files:
+              matrix_items = [{"chunk_id": str(i), "is_resume": "true"} for i in range(len(chunk_files))]
+              matrix_json = json.dumps({"include": matrix_items})
+              print(f"Built Resume Matrix with {len(matrix_items)} jobs")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"matrix={matrix_json}\n")
+                  f.write("has_url_chunks=true\n")
+              sys.exit(0)
+
+          # Fallback to standard sitemap-driven discovery
+          url = os.environ.get("BASE_URL", "https://www.unlimitedfurnituregroup.com").rstrip("/")
           total_input = int(os.environ.get("TOTAL_SITEMAPS", "0") or "0")
           per_job = int(os.environ.get("PER_JOB", "2") or "2")
           if per_job < 1:
@@ -191,7 +192,6 @@ jobs:
                       for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
                           val = loc.text.strip() if loc.text else ""
                           if val:
-                              # Deduplicate canonical filename so sitemap-1-1.xml is not processed twice
                               fname = val.split("/")[-1]
                               if not any(existing.split("/")[-1] == fname for existing in child_sitemaps):
                                   child_sitemaps.append(val)
@@ -207,27 +207,26 @@ jobs:
               total_to_process = total_found
 
           jobs = (total_to_process + per_job - 1) // per_job
-          matrix = []
+          matrix_items = []
           for i in range(jobs):
               offset = i * per_job
               limit = min(per_job, total_to_process - offset)
-              matrix.append({
+              matrix_items.append({
                   "chunk_id": str(offset),
-                  "urls_file": "",
                   "offset": offset,
                   "limit": limit,
-                  "url": url
+                  "is_resume": "false"
               })
 
-          matrix_json = json.dumps(matrix)
-          print(f"Planned {len(matrix)} jobs for {total_to_process} sitemaps (per job: {per_job})")
+          matrix_json = json.dumps({"include": matrix_items})
+          print(f"Planned {len(matrix_items)} jobs for {total_to_process} sitemaps (per job: {per_job})")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={matrix_json}\n")
               f.write("has_url_chunks=false\n")
           EOF
 
       - name: Upload URL chunks artifact
-        if: steps.matrix.outputs.has_url_chunks == 'true'
+        if: steps.build_matrix.outputs.has_url_chunks == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: unlimited_url_chunks
@@ -236,6 +235,7 @@ jobs:
 
   scrape:
     needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.matrix != ''
     runs-on: ubuntu-latest
     timeout-minutes: 240
     services:
@@ -245,8 +245,7 @@ jobs:
           - 8191:8191
     strategy:
       fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix || '[]') }}
+      matrix: ${{ fromJson(needs.plan.outputs.matrix || '{"include":[]}') }}
 
     steps:
       - name: Checkout repository
@@ -273,11 +272,11 @@ jobs:
       - name: Run unlimitedfurniture scraper
         env:
           CHUNK_ID:             ${{ matrix.chunk_id }}
-          URLS_FILE:            ${{ matrix.urls_file }}
+          URLS_FILE:            ${{ matrix.is_resume == 'true' && format('url_chunks/chunk_{0}.txt', matrix.chunk_id) || '' }}
           FLARESOLVERR_URL:     "http://localhost:8191/v1"
-          CURR_URL:             ${{ matrix.url }}
-          SITEMAP_OFFSET:       ${{ matrix.offset }}
-          MAX_SITEMAPS:         ${{ matrix.limit }}
+          CURR_URL:             ${{ github.event.inputs.url }}
+          SITEMAP_OFFSET:       ${{ matrix.offset || '0' }}
+          MAX_SITEMAPS:         ${{ matrix.limit || '0' }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS:          ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY:        ${{ github.event.inputs.request_delay }}
