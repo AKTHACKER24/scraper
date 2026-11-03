@@ -28,8 +28,8 @@ on:
         required: false
         default: true
       urls_per_runner:
-        description: "Max product URLs to scrape per parallel runner"
-        default: "1500"
+        description: "Max product URLs to scrape per parallel runner (recommended 300-400 to complete well within 4h)"
+        default: "350"
       total_runners_per_site:
         description: "Parallel runners per site (0 = auto-calculate based on URLs)"
         default: "0"
@@ -260,19 +260,29 @@ jobs:
                   print(f"No URLs to process for {site_key}, skipping chunk generation.")
                   continue
 
+              # Enforce safe chunk size: at most 350-400 URLs per runner
+              # (At ~100-120 URLs/hour, 350 URLs takes ~3-3.5 hours, safely before GitHub's 6-hour job timeout)
+              target_chunk_size = urls_per_runner if urls_per_runner >= 50 else 350
+              target_chunk_size = min(target_chunk_size, 400)
+
               if total_runners_input > 0:
                   site_chunks = total_runners_input
                   urls_per_chunk = math.ceil(site_total_urls / site_chunks)
               else:
-                  chunk_rate = urls_per_runner if urls_per_runner >= 100 else 1500
-                  site_chunks = math.ceil(site_total_urls / chunk_rate)
-                  urls_per_chunk = chunk_rate
+                  urls_per_chunk = target_chunk_size
+                  site_chunks = math.ceil(site_total_urls / urls_per_chunk)
 
-              # Cap runners per site to prevent exceeding GitHub matrix limits
-              max_per_site = 60 if len(selected) > 1 else 100
+              # Cap runners per site to prevent exceeding GitHub matrix limit (max 256 jobs total)
+              max_per_site = 60 if len(selected) > 1 else 250
               if site_chunks > max_per_site:
                   print(f"Capping runners for {site_key} at {max_per_site} (would have been {site_chunks})")
                   site_chunks = max_per_site
+                  # Bounded safe URLs so no runner ever gets more than 400 URLs (preventing 6hr timeout)
+                  max_safe_urls = site_chunks * target_chunk_size
+                  if site_total_urls > max_safe_urls:
+                      print(f"Limiting total URLs to {max_safe_urls:,} for {site_key} to guarantee each runner finishes within 3-4 hours.")
+                      urls = urls[:max_safe_urls]
+                      site_total_urls = len(urls)
                   urls_per_chunk = math.ceil(site_total_urls / site_chunks)
 
               if site_chunks < 1:

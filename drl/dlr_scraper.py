@@ -424,7 +424,17 @@ class BypassSession:
                 "Sec-Fetch-Site": "same-origin",
             })
 
-        # Fast Strategy 1: Direct curl_cffi with Chrome TLS impersonation (with or without cf_clearance)
+        # Fast Strategy 1: If we have clearance cookies from FlareSolverr, try direct requests.Session first
+        if self.clearance_cookies.get("cf_clearance"):
+            try:
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
+                if resp.status_code == 200 and not self._is_challenge(resp.text):
+                    log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
+                    return resp.text
+            except Exception as e:
+                log(f"Direct session request error with cf_clearance: {e}", "DEBUG")
+
+        # Fast Strategy 2: Direct curl_cffi with Chrome TLS impersonation
         if HAS_CURL_CFFI:
             for imp in ["chrome124", "chrome120"]:
                 try:
@@ -443,23 +453,9 @@ class BypassSession:
                         return resp.text
                     elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
                         log(f"curl_cffi ({imp}) challenged/blocked on {url}", "DEBUG")
-                        if "cf_clearance" in self.clearance_cookies:
-                            self.clearance_cookies.pop("cf_clearance", None)
                         break
                 except Exception as e:
                     log(f"curl_cffi ({imp}) error for {url}: {e}", "DEBUG")
-
-        # Fast Strategy 2: If we have clearance cookies, try requests.Session
-        if self.clearance_cookies.get("cf_clearance"):
-            try:
-                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
-                if resp.status_code == 200 and not self._is_challenge(resp.text):
-                    log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
-                    return resp.text
-                elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
-                    self.clearance_cookies.pop("cf_clearance", None)
-            except Exception as e:
-                log(f"Fast direct session request failed: {e}", "DEBUG")
 
         # Fallback Strategy: If FlareSolverr is configured and direct request was blocked or failed
         if FLARESOLVERR_URL:
