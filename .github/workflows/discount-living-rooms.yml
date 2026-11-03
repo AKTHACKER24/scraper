@@ -187,8 +187,7 @@ jobs:
               selected = [s for s in all_sites if s["site_key"] == "discountlivingrooms"]
 
           os.makedirs("url_chunks", exist_ok=True)
-          manifest = []
-          global_chunk_idx = 0
+          site_data = []
 
           for s in selected:
               site_key = s["site_key"]
@@ -248,45 +247,64 @@ jobs:
               with open(site_master_file, "r", encoding="utf-8") as f:
                   urls = [line.strip() for line in f if line.strip() and line.strip().startswith("http")]
 
-              site_total_urls = len(urls)
-              print(f"Total product URLs discovered for {site_key}: {site_total_urls:,}")
-
-              if max_total_urls > 0 and max_total_urls < site_total_urls:
+              if max_total_urls > 0 and max_total_urls < len(urls):
                   print(f"Limiting {site_key} to first {max_total_urls:,} URLs as requested")
                   urls = urls[:max_total_urls]
-                  site_total_urls = len(urls)
+
+              print(f"Loaded {len(urls):,} URLs for {site_key} ({competitor})")
+              site_data.append({
+                  "site_key": site_key,
+                  "competitor": competitor,
+                  "url": site_url,
+                  "sitemap_url": site_sitemap,
+                  "urls": urls,
+              })
+
+          total_all_urls = sum(len(d["urls"]) for d in site_data)
+          print(f"\nTotal product URLs across all selected sites: {total_all_urls:,}")
+
+          # GitHub Actions matrix maximum limit is 256 jobs. We safely cap at 250 parallel runners.
+          MAX_MATRIX_JOBS = 250
+
+          if total_runners_input > 0:
+              runners_budget = min(total_runners_input, MAX_MATRIX_JOBS)
+          else:
+              raw_runners = sum(math.ceil(len(d["urls"]) / urls_per_runner) for d in site_data if len(d["urls"]) > 0)
+              runners_budget = min(max(1, raw_runners), MAX_MATRIX_JOBS)
+
+          # Proportional allocation of parallel runners across sites
+          # Every single URL is assigned to a chunk without dropping ANY URLs!
+          allocations = {}
+          for d in site_data:
+              n_urls = len(d["urls"])
+              if n_urls == 0:
+                  allocations[d["site_key"]] = 0
+              elif len(site_data) == 1:
+                  allocations[d["site_key"]] = runners_budget
+              else:
+                  allocations[d["site_key"]] = max(1, round(runners_budget * (n_urls / total_all_urls)))
+
+          # Ensure total runners does not exceed MAX_MATRIX_JOBS
+          while sum(allocations.values()) > MAX_MATRIX_JOBS:
+              max_site = max(allocations, key=allocations.get)
+              allocations[max_site] -= 1
+
+          manifest = []
+          global_chunk_idx = 0
+
+          for d in site_data:
+              site_key = d["site_key"]
+              competitor = d["competitor"]
+              site_url = d["url"]
+              site_sitemap = d["sitemap_url"]
+              urls = d["urls"]
+              site_total_urls = len(urls)
 
               if site_total_urls == 0:
-                  print(f"No URLs to process for {site_key}, skipping chunk generation.")
                   continue
 
-              # Enforce safe chunk size: at most 350-400 URLs per runner
-              # (At ~100-120 URLs/hour, 350 URLs takes ~3-3.5 hours, safely before GitHub's 6-hour job timeout)
-              target_chunk_size = urls_per_runner if urls_per_runner >= 50 else 350
-              target_chunk_size = min(target_chunk_size, 400)
-
-              if total_runners_input > 0:
-                  site_chunks = total_runners_input
-                  urls_per_chunk = math.ceil(site_total_urls / site_chunks)
-              else:
-                  urls_per_chunk = target_chunk_size
-                  site_chunks = math.ceil(site_total_urls / urls_per_chunk)
-
-              # Cap runners per site to prevent exceeding GitHub matrix limit (max 256 jobs total)
-              max_per_site = 60 if len(selected) > 1 else 250
-              if site_chunks > max_per_site:
-                  print(f"Capping runners for {site_key} at {max_per_site} (would have been {site_chunks})")
-                  site_chunks = max_per_site
-                  # Bounded safe URLs so no runner ever gets more than 400 URLs (preventing 6hr timeout)
-                  max_safe_urls = site_chunks * target_chunk_size
-                  if site_total_urls > max_safe_urls:
-                      print(f"Limiting total URLs to {max_safe_urls:,} for {site_key} to guarantee each runner finishes within 3-4 hours.")
-                      urls = urls[:max_safe_urls]
-                      site_total_urls = len(urls)
-                  urls_per_chunk = math.ceil(site_total_urls / site_chunks)
-
-              if site_chunks < 1:
-                  site_chunks = 1
+              site_chunks = max(1, allocations.get(site_key, 1))
+              urls_per_chunk = math.ceil(site_total_urls / site_chunks)
 
               for i in range(site_chunks):
                   start_idx = i * urls_per_chunk
@@ -311,7 +329,7 @@ jobs:
                   })
                   global_chunk_idx += 1
 
-              print(f"Divided {site_total_urls:,} URLs for {site_key} into {site_chunks} runners (~{urls_per_chunk:,} URLs/runner)")
+              print(f"Divided ALL {site_total_urls:,} URLs for {site_key} into {site_chunks} runners (~{urls_per_chunk:,} URLs/runner). 100% URLs covered.")
 
           if not manifest:
               print("No URLs or chunks discovered, creating fallback item.")
