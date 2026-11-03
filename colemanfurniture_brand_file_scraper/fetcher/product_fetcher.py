@@ -266,15 +266,20 @@ class ProductFetcher(Spider):
                 if i > 0:
                     headers['Referer'] = urls_to_process[0]
                 
+                req_meta = {
+                    'url': url,
+                    'is_ashley': True,
+                    'chunk_id': self.chunk_id,
+                    'chunk_mode': self.chunk_mode
+                }
+                proxy = os.getenv('PROXY') or os.getenv('HTTPS_PROXY') or ''
+                if proxy:
+                    req_meta['proxy'] = proxy
+
                 yield Request(
                     url,
                     callback=self.parse_product_page_with_check,
-                    meta={
-                        'url': url,
-                        'is_ashley': True,
-                        'chunk_id': self.chunk_id,
-                        'chunk_mode': self.chunk_mode
-                    },
+                    meta=req_meta,
                     errback=self.handle_product_error,
                     priority=10,
                     dont_filter=True,  # Bypass Scrapy's dupefilter since we handle it
@@ -329,10 +334,15 @@ class ProductFetcher(Spider):
             if not self._should_schedule_url(url):
                 continue
             
+            pdp_meta = {'url': url, 'sitemap': sitemap_url}
+            proxy = os.getenv('PROXY') or os.getenv('HTTPS_PROXY') or ''
+            if proxy:
+                pdp_meta['proxy'] = proxy
+            
             yield Request(
                 url,
                 callback=self.parse_product_page_with_check,
-                meta={'url': url, 'sitemap': sitemap_url},
+                meta=pdp_meta,
                 errback=self.handle_product_error
             )
         
@@ -461,19 +471,14 @@ class ProductFetcher(Spider):
         content = {}
         try:
             script_full = response.xpath('//script[@data-hypernova-key="App"]').get()
-            if script_full:
-                m = re.search(r'<!--([\s\S]*?)-->', script_full)
-                raw = m.group(1).strip() if m else ''
-                if not raw:
-                    raw = (response.xpath('//script[@data-hypernova-key="App"]/text()').get() or '').strip()
-                    if raw.startswith('<!--'):
-                        raw = raw[4:]
-                    if raw.endswith('-->'):
-                        raw = raw[:-3]
-                    raw = raw.strip()
-                if raw:
-                    hypernova_data = json.loads(raw)
-                    content = hypernova_data.get('data', {}).get('content', {})
+            if script_full and '{' in script_full and '}' in script_full:
+                start = script_full.find('{')
+                end = script_full.rfind('}')
+                raw = script_full[start:end+1]
+                hypernova_data = json.loads(raw)
+                content = hypernova_data.get('data', {}).get('content', {})
+                if not content and 'content' in hypernova_data:
+                    content = hypernova_data.get('content', {})
         except Exception as e:
             self.logger.debug(f"Error parsing Hypernova script: {e}")
 
@@ -735,8 +740,23 @@ class ProductFetcher(Spider):
             if name:
                 return name
 
+        content = self.get_hypernova_content(response)
+        if content:
+            title = content.get('productInfo', {}).get('title') or content.get('productInfo', {}).get('name')
+            if title:
+                return str(title).strip()
+
+        for script in response.xpath('//script[@type="application/ld+json"]/text()').getall():
+            try:
+                data = json.loads(script)
+                if data.get('@type') in ('Product', 'ProductGroup') and data.get('name'):
+                    return str(data['name']).strip()
+            except Exception:
+                pass
+
         selectors = [
-            '//*[@id="contentId"]/div/div[1]/div[2]/div[2]/h1/text()'
+            '//*[@id="contentId"]/div/div[1]/div[2]/div[2]/h1/text()',
+            '//h1/text()',
         ]
         return self.extract_using_selectors(response, selectors)
     
@@ -946,6 +966,12 @@ class ProductFetcher(Spider):
             productId = selected_item.get('productId', '')
             if productId:
                 return str(productId)
+
+        content = self.get_hypernova_content(response)
+        if content:
+            pid = content.get('productInfo', {}).get('ProductId') or content.get('productInfo', {}).get('id')
+            if pid:
+                return str(pid)
 
         product_id = response.xpath('//div[@data-id]/@data-id').get()        
         if product_id:

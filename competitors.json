@@ -51,9 +51,9 @@
         "name": "Home Gallery Stores",
         "domain": "homegallerystores.com",
         "url": "https://www.homegallerystores.com",
-        "scraper": "",
-        "status": "pending",
-        "notes": ""
+        "scraper": ".github/workflows/home-gallery-stores.yml",
+        "status": "active",
+        "notes": "Full site scrape with github actions"
     },
     "bisonoffice": {
         "name": "BisonOffice.com",

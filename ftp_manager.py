@@ -48,6 +48,24 @@ def normalize_competitor_name(competitor: str) -> str:
     if not competitor:
         return "Unknown"
     comp = competitor.strip()
+    comp_lower = comp.lower().replace("-", "").replace("_", "").replace(" ", "")
+    mappings = {
+        "homegallerystores": "HomeGalleryStores",
+        "homegallery": "HomeGalleryStores",
+        "hgs": "HomeGalleryStores",
+        "emmamason": "EmmaMason",
+        "discountlivingrooms": "DiscountLivingRooms",
+        "bedroomfurniturediscounts": "Bedroomfurniturediscounts",
+        "diningroomsoutlet": "DiningRoomsOutlet",
+        "tvstandsoutlet": "TvStandsOutlet",
+        "coleman": "Coleman",
+        "colemanfurniture": "Coleman",
+        "cymax": "Cymax",
+        "furniturecart": "FurnitureCart",
+        "unlimitedfurniture": "Unlimitedfurniture",
+    }
+    if comp_lower in mappings:
+        return mappings[comp_lower]
     # Preserve pre-formatted camelcase or titlecase
     if comp.istitle() or any(c.isupper() for c in comp[1:]):
         return comp
