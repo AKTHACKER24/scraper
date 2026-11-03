@@ -205,8 +205,14 @@ jobs:
               urls_loaded_from_ftp = False
 
               if use_ftp_urls:
-                  if not (ftp_host and ftp_user and ftp_pass):
-                      print("⚠ FTP secrets (FTP_HOST, FTP_USER, FTP_PASS) are not configured. Falling back to sitemap discovery.")
+                  local_repo_file = f"urls/all_urls_{site_key}.txt"
+                  if os.path.exists(local_repo_file) and os.path.getsize(local_repo_file) > 0:
+                      import shutil
+                      shutil.copyfile(local_repo_file, site_master_file)
+                      print(f"✓ Loaded pre-collected URLs from repository ({os.path.getsize(site_master_file):,} bytes): {local_repo_file}")
+                      urls_loaded_from_ftp = True
+                  elif not (ftp_host and ftp_user and ftp_pass):
+                      print("⚠ FTP secrets not configured and local file not found. Falling back to sitemap discovery.")
                   else:
                       remote_url_file = f"{ftp_path}/urls/all_urls_{site_key}.txt"
                       print(f"\n============================================================")
