@@ -56,8 +56,15 @@ jobs:
             echo "Trying: $sitemap"
             if curl -s -f -L -H "User-Agent: Mozilla/5.0" "$sitemap" | grep -q "<\?xml"; then
               echo "Found valid sitemap at: $sitemap"
-              COUNT=$(curl -s -L -H "User-Agent: Mozilla/5.0" "$sitemap" | grep -c "<loc>" || echo "0")
-              echo "total_sitemaps=$COUNT" >> $GITHUB_OUTPUT
+              PRODUCT_COUNT=$(curl -s -L -H "User-Agent: Mozilla/5.0" "$sitemap" | grep -c "sitemap_products_" || echo "0")
+              if [ "$PRODUCT_COUNT" -gt 0 ]; then
+                echo "Found $PRODUCT_COUNT product sitemaps"
+                echo "total_sitemaps=$PRODUCT_COUNT" >> $GITHUB_OUTPUT
+              else
+                COUNT=$(curl -s -L -H "User-Agent: Mozilla/5.0" "$sitemap" | grep -c "<loc>" || echo "0")
+                echo "Found $COUNT sitemaps"
+                echo "total_sitemaps=$COUNT" >> $GITHUB_OUTPUT
+              fi
               exit 0
             fi
           done
@@ -86,6 +93,12 @@ jobs:
           
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
           
+          # Guard against GitHub Actions 256 matrix jobs limit
+          while [ "$JOBS" -gt 250 ]; do
+            PER_JOB=$(( PER_JOB + 1 ))
+            JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
+          done
+          
           MATRIX="["
           for ((i=0;i<JOBS;i++)); do
             OFFSET=$(( i * PER_JOB ))
@@ -94,7 +107,7 @@ jobs:
           MATRIX="${MATRIX%,}]"
           
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total: $TOTAL sitemaps, $JOBS jobs"
+          echo "Total: $TOTAL sitemaps, $JOBS jobs (sitemaps per job: $PER_JOB)"
 
   scrape:
     needs: plan
@@ -213,7 +226,12 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
-          COMPETITOR="Shopify"
+          
+          SITE_NAME=$(echo "${{ github.event.inputs.url }}" | sed -E 's|https?://||;s|www\.||;s|/.*||;s|\..*||')
+          case "$SITE_NAME" in
+            englishelm)  COMPETITOR="EnglishElm" ;;
+            *)           COMPETITOR=$(echo "$SITE_NAME" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}') ;;
+          esac
 
           echo "competitor=$COMPETITOR" >> $GITHUB_OUTPUT
           echo "date_str=$DATE" >> $GITHUB_OUTPUT
@@ -224,7 +242,7 @@ jobs:
 
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp shopify_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
+          cp products_full.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || cp shopify_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
 
           echo "FTP structure:"
           find ftp_output -type f | sort

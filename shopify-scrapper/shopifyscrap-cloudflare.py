@@ -193,8 +193,12 @@ def fetch_json(url: str, crawl_delay=None) -> Optional[dict]:
         log(f"JSON decode error for {url}: {e}")
         return None
 
-def normalize_image(url: str) -> str:
-    return "https:" + url if url and url.startswith("//") else (url or "")
+def normalize_image(url) -> str:
+    if isinstance(url, dict):
+        url = url.get("src", "")
+    if not url or not isinstance(url, str):
+        return ""
+    return "https:" + url if url.startswith("//") else url
 
 # ================= PRODUCT PROCESSING =================
 
@@ -207,6 +211,8 @@ def extract_category(tags: list):
     return "", ""
 
 def process_product(url: str, writer, seen: set, crawl_delay=None):
+    if not url or "/products/" not in url:
+        return
     if url in seen:
         return
     seen.add(url)
@@ -231,10 +237,36 @@ def process_product(url: str, writer, seen: set, crawl_delay=None):
     product_name = product.get("title", "")
     product_id = product.get("id", "")
     main_image = normalize_image(product.get("featured_image"))
-    product_page_url = f"{CURR_URL}{product.get('url', '')}"
+    if not main_image and product.get("images"):
+        main_image = normalize_image(product["images"][0])
+
+    p_url = product.get("url", "")
+    if p_url and p_url.startswith("http"):
+        product_page_url = p_url
+    elif p_url:
+        product_page_url = f"{CURR_URL}{p_url}"
+    else:
+        product_page_url = url
 
     variants_processed = 0
     for v in product["variants"]:
+        raw_price = v.get("price", "")
+        if raw_price is not None and raw_price != "":
+            try:
+                # In Shopify .js storefront API, price is an integer in cents (e.g. 8276 -> 82.76)
+                if isinstance(raw_price, (int, float)):
+                    price_val = f"{float(raw_price) / 100.0:.2f}"
+                else:
+                    raw_str = str(raw_price).strip()
+                    if "." in raw_str:
+                        price_val = f"{float(raw_str):.2f}"
+                    else:
+                        price_val = f"{float(raw_str) / 100.0:.2f}"
+            except Exception:
+                price_val = str(raw_price)
+        else:
+            price_val = ""
+
         row = [
             f"{product_page_url}?variant={v.get('id', '')}",  # Ref Product URL
             product_id,                         # Ref Product ID
@@ -246,7 +278,7 @@ def process_product(url: str, writer, seen: set, crawl_delay=None):
             v.get("sku", ""),                   # Ref SKU
             v.get("sku", ""),                   # Ref MPN
             v.get("barcode", ""),               # Ref GTIN
-            v.get("price", ""),                 # Ref Price
+            price_val,                          # Ref Price
             main_image,                         # Ref Main Image
             1 if v.get("available") else 0,     # Ref Quantity
             v.get("option1", ""),               # Ref Group Attr 1
@@ -344,16 +376,22 @@ def main():
         sys.exit(1)
     
     ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemaps = [e.text for e in index.findall(".//ns:sitemap/ns:loc", ns)]
+    sitemaps = [e.text for e in index.findall(".//ns:sitemap/ns:loc", ns) if e.text]
     
     if not sitemaps:
         # Try alternative namespace
-        sitemaps = [e.text for e in index.findall(".//sitemap/loc")]
+        sitemaps = [e.text for e in index.findall(".//sitemap/loc") if e.text]
         if not sitemaps:
             # Try without namespace as last resort
-            sitemaps = [e.text for e in index.findall(".//loc")]
+            sitemaps = [e.text for e in index.findall(".//loc") if e.text]
     
-    log(f"Total sitemaps found: {len(sitemaps)}")
+    # Filter to product sitemaps if present
+    product_sitemaps = [s for s in sitemaps if "product" in s.lower()]
+    if product_sitemaps:
+        log(f"Filtering to {len(product_sitemaps)} product sitemaps (out of {len(sitemaps)} total sitemaps)")
+        sitemaps = product_sitemaps
+    else:
+        log(f"Total sitemaps found: {len(sitemaps)}")
     
     # Apply offset and limit
     if MAX_SITEMAPS > 0:
@@ -406,11 +444,14 @@ def main():
                 continue
             
             # Extract URLs
-            urls = [e.text for e in xml.findall(".//ns:url/ns:loc", ns)]
+            urls = [e.text for e in xml.findall(".//ns:url/ns:loc", ns) if e.text]
             if not urls:
-                urls = [e.text for e in xml.findall(".//url/loc")]
+                urls = [e.text for e in xml.findall(".//url/loc") if e.text]
             if not urls:
-                urls = [e.text for e in xml.findall(".//loc")]
+                urls = [e.text for e in xml.findall(".//loc") if e.text]
+            
+            # Only keep product URLs
+            urls = [u for u in urls if u and "/products/" in u]
             
             log(f"  Found {len(urls)} URLs in sitemap")
             all_product_urls.extend([u for u in urls if u])
