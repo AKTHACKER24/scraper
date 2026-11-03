@@ -119,6 +119,9 @@ class FlareSolverrSession:
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
         self.session = requests.Session()
+        self.session_id: Optional[str] = None
+        self.clearance_cookies: Dict[str, str] = {}
+        self.user_agent: Optional[str] = None
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -133,16 +136,90 @@ class FlareSolverrSession:
             "Cache-Control": "max-age=0",
             "Referer": CURR_URL + "/",
         }
+        self._init_session()
+
+    def _init_session(self) -> bool:
+        """Create a persistent session in FlareSolverr to preserve Cloudflare cookies/clearance"""
+        try:
+            payload = {"cmd": "sessions.create"}
+            resp = self.session.post(self.endpoint, json=payload, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "ok":
+                    self.session_id = data.get("session")
+                    log(f"Created persistent FlareSolverr session: {self.session_id} on {self.endpoint}", "INFO")
+                    return True
+            log(f"FlareSolverr session creation returned status {resp.status_code} on {self.endpoint}", "WARNING")
+        except Exception as e:
+            log(f"Could not create persistent FlareSolverr session on {self.endpoint}: {e}", "WARNING")
+        return False
+
+    def _destroy_session(self):
+        """Destroy current FlareSolverr session if active"""
+        if self.session_id:
+            try:
+                self.session.post(
+                    self.endpoint,
+                    json={"cmd": "sessions.destroy", "session": self.session_id},
+                    timeout=10
+                )
+            except Exception:
+                pass
+            self.session_id = None
+
+    def warm_up(self, base_url: str) -> bool:
+        """Visit homepage to solve initial Cloudflare Turnstile challenge and establish cf_clearance"""
+        for attempt in range(3):
+            if not self.session_id:
+                self._init_session()
+            log(f"Warming up FlareSolverr session on {base_url} (attempt {attempt + 1})...", "INFO")
+            payload = {
+                "cmd": "request.get",
+                "url": base_url,
+                "maxTimeout": FLARESOLVERR_REQUEST_TIMEOUT_MS
+            }
+            if self.session_id:
+                payload["session"] = self.session_id
+            try:
+                res = self.session.post(self.endpoint, json=payload, timeout=FLARESOLVERR_TIMEOUT)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("status") == "ok":
+                        solution = data.get("solution", {})
+                        cookies = solution.get("cookies", [])
+                        for c in cookies:
+                            self.clearance_cookies[c.get("name")] = c.get("value")
+                            self.session.cookies.set(
+                                c.get("name"),
+                                c.get("value"),
+                                domain=c.get("domain")
+                            )
+                        if solution.get("userAgent"):
+                            self.user_agent = solution.get("userAgent")
+                        log(f"✓ FlareSolverr session successfully warmed up for {base_url}", "INFO")
+                        return True
+                log(f"Warm-up attempt {attempt + 1} response: {res.status_code}")
+            except Exception as e:
+                log(f"Warm-up attempt {attempt + 1} error: {e}")
+            self._destroy_session()
+            time.sleep(2)
+        return False
 
     def flaresolverr_request(self, url: str, max_retries: int = 3) -> Optional[Tuple[str, int]]:
         """Make request through FlareSolverr to bypass Cloudflare"""
         for attempt in range(max_retries):
+            if not self.session_id:
+                if self._init_session():
+                    self.warm_up(CURR_URL)
+
             try:
                 payload = {
                     "cmd": "request.get",
                     "url": url,
                     "maxTimeout": FLARESOLVERR_REQUEST_TIMEOUT_MS
                 }
+                if self.session_id:
+                    payload["session"] = self.session_id
                 
                 response = self.session.post(
                     self.endpoint,
@@ -160,27 +237,40 @@ class FlareSolverrSession:
                         # Extract cookies for potential future requests
                         cookies = solution.get("cookies", [])
                         for cookie in cookies:
+                            self.clearance_cookies[cookie.get("name")] = cookie.get("value")
                             self.session.cookies.set(
                                 cookie.get("name"),
                                 cookie.get("value"),
                                 domain=cookie.get("domain")
                             )
+                        if solution.get("userAgent"):
+                            self.user_agent = solution.get("userAgent")
                         
                         return content, 200
                 
-                if response.status_code >= 500:
-                    self._rotate_to_next_endpoint()
                 err_detail = ""
                 try:
-                    err_detail = f" - {response.text[:200]}"
+                    err_json = response.json()
+                    err_detail = f" - {err_json.get('message', '')}"
                 except Exception:
-                    pass
+                    try:
+                        err_detail = f" - {response.text[:200]}"
+                    except Exception:
+                        pass
                 log(f"FlareSolverr attempt {attempt + 1} failed for {url}: {response.status_code}{err_detail}")
                 
+                # If Cloudflare blocked or returned 500, reset session and rotate endpoint
+                if response.status_code >= 500 or "blocked" in err_detail.lower():
+                    self._destroy_session()
+                    time.sleep(2 ** attempt)
+                    self._rotate_to_next_endpoint()
+                
             except requests.exceptions.Timeout:
+                self._destroy_session()
                 self._rotate_to_next_endpoint()
                 log(f"FlareSolverr timeout on attempt {attempt + 1} for {url}")
             except requests.exceptions.ConnectionError:
+                self._destroy_session()
                 self._rotate_to_next_endpoint()
                 log(f"FlareSolverr connection error on attempt {attempt + 1} for {url}")
             except Exception as e:
@@ -200,6 +290,7 @@ class FlareSolverrSession:
             fs_assign_count += 1
         if endpoint != self.endpoint:
             log(f"Switching FlareSolverr endpoint from {self.endpoint} to {endpoint}", "DEBUG")
+            self._destroy_session()
             self.endpoint = endpoint
 
     def fetch(self, url: str) -> Optional[Tuple[str, int]]:
@@ -249,7 +340,11 @@ def check_robots_txt():
     robots_url = f"{CURR_URL}/robots.txt"
     log(f"Checking robots.txt: {robots_url}")
     
-    content, status = get_thread_flaresolverr_session().fetch(robots_url)
+    session = get_thread_flaresolverr_session()
+    # Warm up FlareSolverr session with base domain to establish cookies & pass Turnstile
+    session.warm_up(CURR_URL)
+    
+    content, status = session.fetch(robots_url)
     if content and status == 200:
         lines = content.split('\n')
         crawl_delay = None
@@ -352,7 +447,14 @@ def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
     if not data:
         return None
     try:
-        return ET.fromstring(data)
+        xml_data = data
+        if "<?xml" in xml_data:
+            xml_data = xml_data[xml_data.find("<?xml"):]
+        elif "<sitemapindex" in xml_data:
+            xml_data = xml_data[xml_data.find("<sitemapindex"):]
+        elif "<urlset" in xml_data:
+            xml_data = xml_data[xml_data.find("<urlset"):]
+        return ET.fromstring(xml_data)
     except ET.ParseError as e:
         log(f"XML parse error for {url}: {e}")
         return None
@@ -634,6 +736,16 @@ def main():
             log(f"Success rate:       {success_rate:.1f}%")
         log(f"Chunk output saved: {OUTPUT_CSV}")
         log("=" * 60)
+
+        # Save per-chunk URL list for artifact upload
+        try:
+            _url_list_file = f"url_list_chunk_{CHUNK_ID}.txt"
+            with open(_url_list_file, "w", encoding="utf-8") as _uf:
+                _uf.write("\n".join(urls_to_process))
+            log(f"[URL-LIST] Saved {len(urls_to_process)} URLs to {_url_list_file}")
+        except Exception as _exc:
+            log(f"[URL-LIST] Warning: {_exc}", "WARNING")
+
         return
     
     # ------------------------------------------------------------------
@@ -744,45 +856,64 @@ def main():
             sitemap = robots_sitemap
 
         index = load_xml(sitemap, crawl_delay)
-        if index is None:
-            log("Failed to load sitemap index", "ERROR")
-            sys.exit(1)
 
         ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
         sitemaps = []
-        for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
-            elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
-            if elements:
-                sitemaps = [e.text.strip() for e in elements if e.text]
-                break
+        if index is not None:
+            for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
+                elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
+                if elements:
+                    sitemaps = [e.text.strip() for e in elements if e.text]
+                    break
 
         if not sitemaps:
-            log("No sitemaps found in index", "ERROR")
-            sys.exit(1)
+            log("No sitemaps found in index or index fetch blocked; using child sitemap fallback (sitemap1..15)", "WARNING")
+            sitemaps = [f"{CURR_URL}/sitemap{i}.xml" for i in range(1, 16)]
 
         all_urls = []
 
         for i, sitemap_url in enumerate(sitemaps, 1):
             log(f"Collecting from sitemap {i}/{len(sitemaps)}: {sitemap_url}")
-            xml = load_xml(sitemap_url, crawl_delay)
-            if not xml:
+            data = http_get(sitemap_url, crawl_delay)
+            if not data:
+                log(f"Failed to fetch sitemap: {sitemap_url}", "WARNING")
                 continue
 
             urls = []
-            for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
-                elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
-                if elements:
-                    urls = [
-                        e.text.strip()
-                        for e in elements
-                        if e.text
-                        and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
-                        and ('.htm' in e.text)
-                    ]
-                    if urls:
-                        break
+            try:
+                xml_data = data
+                if "<?xml" in xml_data:
+                    xml_data = xml_data[xml_data.find("<?xml"):]
+                elif "<urlset" in xml_data:
+                    xml_data = xml_data[xml_data.find("<urlset"):]
+                xml = ET.fromstring(xml_data)
+                for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                    elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                    if elements:
+                        urls = [
+                            e.text.strip()
+                            for e in elements
+                            if e.text
+                            and not any(ext in e.text.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
+                            and ('.htm' in e.text)
+                        ]
+                        if urls:
+                            break
+            except Exception as e:
+                log(f"XML parse error for {sitemap_url}: {e}, using regex fallback", "DEBUG")
 
+            if not urls:
+                found = re.findall(r'<loc>\s*(https?://[^\s<]+\.htm[^\s<]*)\s*</loc>', data, re.IGNORECASE)
+                if not found:
+                    found = re.findall(r'https?://[^\s"\'<>]+\.htm[^\s"\'<>]*', data, re.IGNORECASE)
+                urls = [
+                    u.strip() for u in set(found)
+                    if not any(ext in u.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
+                ]
+
+            log(f"Found {len(urls)} product URLs in {sitemap_url}")
             all_urls.extend(urls)
+            time.sleep(max(1.0, crawl_delay or 1.0))
 
         # Deduplicate while preserving order
         unique_urls = list(dict.fromkeys(all_urls))
@@ -795,6 +926,10 @@ def main():
         log(f"Total URLs collected: {len(unique_urls)}")
         log(f"Saved to: {MASTER_URLS_FILE}")
         log("=" * 60)
+
+        if not unique_urls:
+            log("No URLs collected! Aborting.", "ERROR")
+            sys.exit(1)
 
         sys.exit(0)
     # ------------------------------------------------------------------
@@ -927,17 +1062,6 @@ def main():
     log("=" * 60)
 
 
-# Save per-chunk URL list for artifact upload (merged in YML merge job)
-if __name__ == "__main__" and 'all_product_urls' in dir() and all_product_urls:
-    try:
-        _chunk_id = locals().get('CHUNK_ID') or locals().get('SITEMAP_OFFSET', '0')
-        _url_list_file = f"url_list_chunk_{_chunk_id}.txt"
-        with open(_url_list_file, "w", encoding="utf-8") as _uf:
-            _uf.write("\n".join(all_product_urls))
-        print(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {_url_list_file}", flush=True)
-    except Exception as _exc:
-        print(f"[URL-LIST] Warning: {_exc}", flush=True)
-
 if __name__ == "__main__":
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -963,4 +1087,3 @@ if __name__ == "__main__":
         log("⚠ FLARESOLVERR_URL/FLARESOLVERR_URLS not set, requests will fail behind Cloudflare")
 
     main()
-    log(f"Note: URL tracking post-processing error: {exc}")

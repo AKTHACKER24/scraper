@@ -45,8 +45,8 @@ jobs:
       - name: Start FlareSolverr pool
         id: flaresolverr_pool
         run: |
-          INSTANCES="${{ github.event.inputs.max_workers }}"
-          PLAN_MAX_INSTANCES=4
+          INSTANCES=1
+          PLAN_MAX_INSTANCES=1
           if ! [[ "$INSTANCES" =~ ^[0-9]+$ ]] || [ "$INSTANCES" -lt 1 ]; then
             INSTANCES=1
           fi
