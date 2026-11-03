@@ -6,33 +6,66 @@ on:
       url:
         description: "Base site URL"
         required: true
-        default: "https://www.emmamason.com"
-      total_sitemaps:
-        description: "Total sitemaps to process (0 = auto)"
+        default: "https://emmamason.com"
+      sitemap_url:
+        description: "Direct Sitemap URL (optional, skips auto-discovery)"
+        required: false
+        default: ""
+      urls_per_runner:
+        description: "Max product URLs to scrape per parallel runner"
+        default: "1500"
+      total_runners:
+        description: "Total parallel runners (0 = auto-calculate based on URLs)"
         default: "0"
-      sitemaps_per_job:
-        description: "Sitemaps per parallel job"
-        default: "2"
-      urls_per_sitemap:
-        description: "Max URLs per sitemap"
-        default: "100"
+      max_total_urls:
+        description: "Max total URLs to scrape across all sitemaps (0 = all / full)"
+        default: "0"
       max_workers:
         description: "Parallel requests per job"
-        default: "4"
+        default: "8"
       request_delay:
         description: "Delay between requests (seconds)"
-        default: "1.0"
+        default: "0.3"
       sample_size:
         description: "Number of URLs to sample for product checking"
         default: "5"
+      total_sitemaps:
+        description: "Legacy: Total sitemaps (deprecated, auto-discovered)"
+        default: "0"
+      sitemaps_per_job:
+        description: "Legacy: Sitemaps per job (deprecated, now partitioned by URLs)"
+        default: "2"
+      urls_per_sitemap:
+        description: "Legacy: Max URLs per sitemap (0 = all)"
+        default: "0"
+
+env:
+  FTP_HOST: ${{ secrets.FTP_HOST || 'ftp-sandbox.1sb.pp.ua' }}
+  FTP_PORT: ${{ secrets.FTP_PORT || '21' }}
+  FTP_USER: ${{ secrets.FTP_USER || 'onestop_ftp-sandbox' }}
+  FTP_PASS: ${{ secrets.FTP_PASS || 'OneStop123' }}
+  FTP_PATH: ${{ secrets.FTP_PATH || '/scrap/' }}
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      matrix: ${{ steps.generate_matrix.outputs.matrix }}
       site_name: ${{ steps.get_site_name.outputs.site_name }}
+      total_urls: ${{ steps.generate_matrix.outputs.total_urls }}
+      chunk_count: ${{ steps.generate_matrix.outputs.chunk_count }}
+
+    # Service container for Cloudflare bypass during sitemap discovery
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
+
     steps:
+      - uses: actions/checkout@v4
+
       - name: Get site name from URL
         id: get_site_name
         run: |
@@ -40,74 +73,20 @@ jobs:
           SITE_NAME=$(echo "$URL" | sed -E 's|https?://||;s|www\.||;s|\.[a-zA-Z]+(/.*)?$||;s|/.*||')
           echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
           echo "Site name extracted: $SITE_NAME"
-      
-      - id: matrix
-        run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.url }}"
-          
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "Using default total sitemaps: 10"
-            TOTAL=10
-          fi
-          
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
-          
-          MATRIX="["
-          for ((i=0;i<JOBS;i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
-          done
-          MATRIX="${MATRIX%,}]"
-          
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total sitemaps: $TOTAL"
-          echo "Sitemaps per job: $PER_JOB"
-          echo "Jobs planned: $JOBS"
-
-  scrape:
-    needs: plan
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix) }}
-    
-    # Simplified service container without health check
-    services:
-      flaresolverr:
-        image: ghcr.io/flaresolverr/flaresolverr:latest
-        ports:
-          - 8191:8191
-        options: --cap-add=SYS_ADMIN
-    
-    steps:
-      - uses: actions/checkout@v4
 
       - name: Wait for FlareSolverr to be ready
         run: |
           echo "Waiting for FlareSolverr service to be ready..."
-          # Give the container time to start
           sleep 10
-          
-          # Test connection with retries
           for i in {1..30}; do
             if curl -s -f -X POST http://localhost:8191/v1 \
               -H "Content-Type: application/json" \
               -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
               echo "✓ FlareSolverr is ready!"
-              
-              # Test with a simple request
-              TEST_RESPONSE=$(curl -s -X POST http://localhost:8191/v1 \
-                -H "Content-Type: application/json" \
-                -d '{"cmd": "sessions.create"}')
-              echo "FlareSolverr test response: $TEST_RESPONSE"
               break
             fi
             echo "Attempt $i: FlareSolverr not ready yet..."
             sleep 2
-            
             if [ $i -eq 30 ]; then
               echo "❌ FlareSolverr failed to start after 60 seconds"
               docker logs flaresolverr || true
@@ -123,75 +102,269 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
 
-      - name: Create scraper file
+      - name: Discover all sitemaps and count products
+        id: discover_urls
+        env:
+          CURR_URL: ${{ github.event.inputs.url }}
+          SITEMAP_URL: ${{ github.event.inputs.sitemap_url }}
+          FLARESOLVERR_URL: http://localhost:8191/v1
+          FLARESOLVERR_TIMEOUT: "120"
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
+          COLLECT_URLS_ONLY: "1"
+          MASTER_URLS_FILE: emmamason_all_urls.txt
         run: |
-          cat > em_scraper.py << 'EOF'
-          # PASTE THE COMPLETE SCRAPER CODE HERE
+          python drl/em_scraper.py
+
+      - name: Partition URLs evenly amongst runners and build matrix
+        id: generate_matrix
+        env:
+          URLS_PER_RUNNER: ${{ github.event.inputs.urls_per_runner }}
+          TOTAL_RUNNERS: ${{ github.event.inputs.total_runners }}
+          MAX_TOTAL_URLS: ${{ github.event.inputs.max_total_urls }}
+          CURR_URL: ${{ github.event.inputs.url }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          import json
+          import math
+
+          urls_file = "emmamason_all_urls.txt"
+          if not os.path.exists(urls_file):
+              print("Error: emmamason_all_urls.txt was not generated!")
+              exit(1)
+
+          with open(urls_file, "r", encoding="utf-8") as f:
+              urls = [line.strip() for line in f if line.strip() and line.strip().startswith("http")]
+
+          total_urls = len(urls)
+          print(f"Total product URLs collected across all sitemaps: {total_urls:,}")
+
+          max_total = int(os.environ.get("MAX_TOTAL_URLS", "0") or "0")
+          if max_total > 0 and max_total < total_urls:
+              print(f"Limiting to first {max_total:,} URLs as requested")
+              urls = urls[:max_total]
+              total_urls = len(urls)
+
+          urls_per_runner = int(os.environ.get("URLS_PER_RUNNER", "1500") or "1500")
+          total_runners = int(os.environ.get("TOTAL_RUNNERS", "0") or "0")
+
+          if total_runners > 0:
+              chunk_count = total_runners
+              urls_per_chunk = math.ceil(total_urls / chunk_count)
+          else:
+              if urls_per_runner < 100:
+                  urls_per_runner = 1500
+              chunk_count = math.ceil(total_urls / urls_per_runner)
+              urls_per_chunk = urls_per_runner
+
+          # Cap at 100 runners to stay well within GitHub Actions limits
+          if chunk_count > 100:
+              print(f"Capping runners at 100 (would have been {chunk_count})")
+              chunk_count = 100
+              urls_per_chunk = math.ceil(total_urls / chunk_count)
+
+          if chunk_count < 1:
+              chunk_count = 1
+
+          os.makedirs("url_chunks", exist_ok=True)
+          matrix_items = []
+
+          for i in range(chunk_count):
+              start_idx = i * urls_per_chunk
+              end_idx = min(start_idx + urls_per_chunk, total_urls)
+              chunk_urls = urls[start_idx:end_idx]
+              if not chunk_urls:
+                  continue
+              chunk_file = f"url_chunks/chunk_{i}.txt"
+              with open(chunk_file, "w", encoding="utf-8") as cf:
+                  cf.write("\n".join(chunk_urls))
+              matrix_items.append({
+                  "chunk_index": i,
+                  "total_chunks": chunk_count,
+                  "chunk_file": chunk_file,
+                  "url_count": len(chunk_urls),
+                  "url": os.environ.get("CURR_URL", "https://emmamason.com")
+              })
+
+          print(f"Successfully divided {total_urls:,} products into {len(matrix_items)} runners (~{urls_per_chunk:,} URLs/runner)")
+          matrix_json = json.dumps(matrix_items)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={matrix_json}\n")
+              f.write(f"total_urls={total_urls}\n")
+              f.write(f"chunk_count={len(matrix_items)}\n")
           EOF
+
+      - name: Upload URL chunks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emma_mason_url_chunks
+          path: url_chunks/*.txt
+          retention-days: 1
+
+      - name: Upload master URL list artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emma_mason_all_sitemap_urls
+          path: emmamason_all_urls.txt
+          retention-days: 2
+
+  scrape:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    name: "Scrape chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }} (${{ matrix.url_count }} URLs)"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+
+    # Service container for Cloudflare bypass
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
+
+      - name: Download URL chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: emma_mason_url_chunks
+          path: url_chunks
 
       - name: Run Emma Mason scraper with FlareSolverr
         id: scrape_run
         continue-on-error: true
         env:
           CURR_URL: ${{ matrix.url }}
-          SITEMAP_OFFSET: ${{ matrix.offset }}
-          MAX_SITEMAPS: ${{ matrix.limit }}
-          MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
+          URLS_FILE: ${{ matrix.chunk_file }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
+          TOTAL_CHUNKS: ${{ matrix.total_chunks }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
           SAMPLE_SIZE: ${{ github.event.inputs.sample_size }}
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
           FLARESOLVERR_URL: http://localhost:8191/v1
+          FLARESOLVERR_TIMEOUT: "120"
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          FTP_SYNC_ITEMS: "100"
         run: |
-          echo "Starting Emma Mason scraper with FlareSolverr:"
-          echo "CURR_URL: $CURR_URL"
-          echo "SITEMAP_OFFSET: $SITEMAP_OFFSET"
-          echo "MAX_SITEMAPS: $MAX_SITEMAPS"
-          echo "MAX_URLS_PER_SITEMAP: $MAX_URLS_PER_SITEMAP"
+          echo "Starting Emma Mason scraper chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }}:"
+          echo "URLS_FILE: ${{ matrix.chunk_file }} (${{ matrix.url_count }} URLs)"
           echo "MAX_WORKERS: $MAX_WORKERS"
           echo "REQUEST_DELAY: $REQUEST_DELAY"
-          echo "SAMPLE_SIZE: $SAMPLE_SIZE"
           echo "FLARESOLVERR_URL: $FLARESOLVERR_URL"
           echo ""
-          
-          # Add connection test in Python
-          python -c "
-          import requests
-          import sys
-          try:
-              r = requests.post('http://localhost:8191/v1', 
-                              json={'cmd': 'sessions.list'}, 
-                              timeout=10)
-              print(f'✓ FlareSolverr connection test: {r.status_code}')
-              sys.exit(0)
-          except Exception as e:
-              print(f'✗ FlareSolverr connection failed: {e}')
-              sys.exit(1)
-          "
-          
-          python drl/em_scraper.py || echo "Scraper failed with exit code $?"
-          
+
+          python drl/em_scraper.py || echo "Scraper finished with exit code $?"
+
           echo ""
           echo "Generated files:"
-          ls -la *.csv 2>/dev/null || echo "No CSV files generated"
+          ls -la products_chunk_*.csv 2>/dev/null || echo "No CSV files generated"
+
+      - name: Rescue remaining chunk data to FTP on exit
+        if: always()
+        env:
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
+        run: |
+          python3 - << 'EOF'
+          import os, glob, sys
+          from datetime import datetime, timezone
+          sys.path.insert(0, ".")
+          from ftp_manager import FTPManager
+
+          host = os.environ.get("FTP_HOST", "").strip()
+          user = os.environ.get("FTP_USER", "").strip()
+          pass_ = os.environ.get("FTP_PASS", "").strip()
+          port = int(os.environ.get("FTP_PORT", "21"))
+          base_path = os.environ.get("FTP_PATH", "/scrap/").strip()
+          chunk_idx = os.environ.get("CHUNK_INDEX", "0")
+          comp = "EmmaMason"
+          date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+          if not host or not user or not pass_:
+              print("No FTP configured, skipping rescue upload.")
+              sys.exit(0)
+
+          csvs = glob.glob(f"products_chunk_{chunk_idx}.csv") + glob.glob("products_chunk_*.csv")
+          txts = glob.glob(f"url_list_chunk_{chunk_idx}.txt") + glob.glob("url_list_chunk_*.txt")
+
+          target_files = [f for f in set(csvs + txts) if os.path.exists(f) and os.path.getsize(f) > 0]
+          if not target_files:
+              print("No chunk files found to rescue.")
+              sys.exit(0)
+
+          print(f"Rescuing {len(target_files)} chunk file(s) to FTP for {comp}...")
+          ftp = FTPManager(host=host, user=user, pass_=pass_, port=port, base_dir=base_path)
+          remote_temp_dir = f"{base_path.rstrip('/')}/{comp}/{date_str}/output/temp"
+
+          for local_f in target_files:
+              remote_f = f"{remote_temp_dir}/{os.path.basename(local_f)}"
+              ftp.upload_file(local_f, remote_f)
+
+          ftp.disconnect()
+          print("Rescue upload step complete.")
+          EOF
 
       - name: Upload chunk (even on failure)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: chunk_${{ matrix.offset }}
+          name: chunk_${{ matrix.chunk_index }}
           path: |
-            |
-            url_list_chunk_*.txt
             products_chunk_*.csv
+            url_list_chunk_*.txt
           if-no-files-found: warn
 
   merge:
     needs: [plan, scrape]
     runs-on: ubuntu-latest
     if: always() && !cancelled()
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -209,11 +382,18 @@ jobs:
           pattern: chunk_*
           merge-multiple: true
 
+      - name: Download master URL list
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: emma_mason_all_sitemap_urls
+          path: master_urls
+
       - name: Check for CSV files
         id: check_files
         run: |
           CSV_FILES=$(find chunks -name "products_chunk_*.csv" 2>/dev/null || echo "")
-          
+
           if [ -z "$CSV_FILES" ]; then
             echo "has_files=false" >> $GITHUB_OUTPUT
             echo "ERROR: No CSV files found in artifacts!"
@@ -231,14 +411,14 @@ jobs:
         if: steps.check_files.outputs.has_files == 'true'
         run: |
           echo "Merging CSV chunks..."
-          
+
           CSV_FILES=$(find chunks -name "products_chunk_*.csv")
-          
+
           FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
           echo "Using header from: $FIRST_FILE"
-          
+
           head -n 1 "$FIRST_FILE" > products_full.csv
-          
+
           TOTAL_ROWS=0
           FILE_COUNT=0
           for f in $CSV_FILES; do
@@ -250,7 +430,7 @@ jobs:
               tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> products_full.csv
             fi
           done
-          
+
           FINAL_ROWS=$(tail -n +2 products_full.csv 2>/dev/null | wc -l || echo "0")
           echo "Merged $FINAL_ROWS rows from $FILE_COUNT files"
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
@@ -266,12 +446,16 @@ jobs:
           DATE=$(date +%F_%H%M%S)
           echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
           echo "Generated filename: ${SITE_NAME}_${DATE}.csv"
-
+          cp products_full.csv "${SITE_NAME}_${DATE}.csv" 2>/dev/null || true
 
       - name: Merge per-chunk URL lists
         id: merge_urls
         run: |
-          find chunks -name "url_list_chunk_*.txt" 2>/dev/null | sort | xargs cat 2>/dev/null | sort -u > all_sitemap_urls.txt || true
+          if [ -f "master_urls/emmamason_all_urls.txt" ]; then
+            cp master_urls/emmamason_all_urls.txt all_sitemap_urls.txt
+          else
+            find chunks -name "url_list_chunk_*.txt" 2>/dev/null | sort | xargs cat 2>/dev/null | sort -u > all_sitemap_urls.txt || true
+          fi
           URL_COUNT=$(wc -l < all_sitemap_urls.txt | tr -d ' ')
           echo "Total unique sitemap URLs: $URL_COUNT"
           echo "url_count=$URL_COUNT" >> $GITHUB_OUTPUT
@@ -281,7 +465,7 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
-          COMPETITOR="Emmamason"
+          COMPETITOR="EmmaMason"
 
           echo "competitor=$COMPETITOR" >> $GITHUB_OUTPUT
           echo "date_str=$DATE" >> $GITHUB_OUTPUT
@@ -292,7 +476,7 @@ jobs:
 
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp emmamason_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
+          cp products_full.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || cp "${{ steps.meta.outputs.name }}" "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
 
           echo "FTP structure:"
           find ftp_output -type f | sort
@@ -313,26 +497,28 @@ jobs:
           fi
 
       - name: Upload to FTP (structured path)
+        env:
+          FTP_HOST:     ${{ env.FTP_HOST }}
+          FTP_PORT:     ${{ env.FTP_PORT }}
+          FTP_USER:     ${{ env.FTP_USER }}
+          FTP_PASS:     ${{ env.FTP_PASS }}
+          FTP_PATH:     ${{ env.FTP_PATH }}
         run: |
           if [ -z "$FTP_HOST" ] || [ -z "$FTP_USER" ] || [ -z "$FTP_PASS" ]; then
             echo "FTP credentials not set — skipping upload."
             exit 0
           fi
-          sudo apt-get update -qq && sudo apt-get install -y lftp
-          COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
-          DATE="${{ steps.ftp_structure.outputs.date_str }}"
-          BASE="${FTP_BASE_DIR}/${COMPETITOR}/${DATE}"
-          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-          set ftp:ssl-allow no
-          mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}
-          bye
-          EOF
-          echo "FTP upload complete: ${BASE}"
-        env:
-          FTP_HOST:     ${{ secrets.FTP_HOST }}
-          FTP_USER:     ${{ secrets.FTP_USER }}
-          FTP_PASS:     ${{ secrets.FTP_PASS }}
-          FTP_BASE_DIR: ${{ secrets.FTP_PATH }}
+          echo "Uploading EmmaMason output to FTP server..."
+          python3 ftp_manager.py upload -c EmmaMason -b ftp_output || {
+            echo "ftp_manager upload failed, falling back to lftp..."
+            which lftp >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y lftp)
+            COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
+            DATE="${{ steps.ftp_structure.outputs.date_str }}"
+            CLEAN_PATH="${FTP_PATH%/}"
+            BASE="${CLEAN_PATH}/${COMPETITOR}/${DATE}"
+            lftp -e "set ftp:ssl-allow no; mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}; bye" -u "$FTP_USER","$FTP_PASS" -p "${FTP_PORT:-21}" "$FTP_HOST" || true
+            echo "FTP upload complete: ${BASE}"
+          }
 
       - name: Create summary report
         run: |
@@ -343,7 +529,7 @@ jobs:
           TOTAL_ROWS="${{ steps.merge_csv.outputs.final_rows || '0' }}"
           SUCCESSFUL_CHUNKS="${{ steps.check_files.outputs.chunk_count || '0' }}"
           PLANNED_JOBS="${{ fromJson(needs.plan.outputs.matrix).length || '0' }}"
-          
+
           echo "========================================="
           echo "          SCRAPING SUMMARY"
           echo "========================================="
@@ -363,13 +549,9 @@ jobs:
           echo "Configuration:"
           echo "  Max Workers:   ${{ github.event.inputs.max_workers }}"
           echo "  Request Delay: ${{ github.event.inputs.request_delay }}s"
-          echo "  URLs/Sitemap:  ${{ github.event.inputs.urls_per_sitemap }}"
-          echo "  Sitemaps/Job:  ${{ github.event.inputs.sitemaps_per_job }}"
-          echo "  Total Sitemaps: ${{ github.event.inputs.total_sitemaps }}"
-          echo "  Sample Size:   ${{ github.event.inputs.sample_size }}"
           echo "  FlareSolverr:  Enabled (Service Container)"
           echo "========================================="
-          
+
           if [ -f "products_full.csv" ]; then
             echo ""
             echo "First 3 rows of data:"
@@ -386,6 +568,5 @@ jobs:
         with:
           name: final_results
           path: |
-            products_full.json
-            products_full.csv
+            ${{ steps.meta.outputs.name }}
           retention-days: 7

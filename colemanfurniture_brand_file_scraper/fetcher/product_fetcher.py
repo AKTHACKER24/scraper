@@ -81,6 +81,7 @@ class ProductFetcher(Spider):
         self.last_log_time = self.start_time
         self.log_interval = 30  # Log progress every 30 seconds
         self.sitemap_urls_count = {}  # Track URLs per sitemap
+        self._hypernova_cache = {}
         
         self.logger.info(f"📁 Starting job {self.job_id} - chunk {self.chunk_id}")
 
@@ -451,20 +452,81 @@ class ProductFetcher(Spider):
                 ProductFetcher._collect_htm_urls(item, found, _skip_keys)
         return found
 
+    def get_hypernova_content(self, response):
+        """Extract and parse Hypernova App JSON from response."""
+        cache_key = id(response)
+        if hasattr(self, '_hypernova_cache') and cache_key in self._hypernova_cache:
+            return self._hypernova_cache[cache_key]
+        
+        content = {}
+        try:
+            script_full = response.xpath('//script[@data-hypernova-key="App"]').get()
+            if script_full:
+                m = re.search(r'<!--([\s\S]*?)-->', script_full)
+                raw = m.group(1).strip() if m else ''
+                if not raw:
+                    raw = (response.xpath('//script[@data-hypernova-key="App"]/text()').get() or '').strip()
+                    if raw.startswith('<!--'):
+                        raw = raw[4:]
+                    if raw.endswith('-->'):
+                        raw = raw[:-3]
+                    raw = raw.strip()
+                if raw:
+                    hypernova_data = json.loads(raw)
+                    content = hypernova_data.get('data', {}).get('content', {})
+        except Exception as e:
+            self.logger.debug(f"Error parsing Hypernova script: {e}")
+
+        if not hasattr(self, '_hypernova_cache'):
+            self._hypernova_cache = {}
+        self._hypernova_cache[cache_key] = content
+        return content
+
+    def _find_selected_simple_item(self, response, content=None):
+        if content is None:
+            content = self.get_hypernova_content(response)
+        if not content:
+            return None
+        product_layouts = content.get('productLayouts', {})
+        simple_items = product_layouts.get('simpleItems', [])
+        if not simple_items:
+            return None
+
+        current_url = response.url.rstrip('/')
+        try:
+            current_path = urlparse(response.url).path.rstrip('/')
+        except Exception:
+            current_path = ''
+        selected_layout_id = str(product_layouts.get('selectedLayoutId') or '')
+
+        # 1. Match by URL or path
+        for item in simple_items:
+            if isinstance(item, dict):
+                item_url = item.get('url', '').rstrip('/')
+                try:
+                    item_path = urlparse(item_url).path.rstrip('/') if item_url else ''
+                except Exception:
+                    item_path = ''
+                if item_url and (item_url == current_url or (item_path and item_path == current_path)):
+                    return item
+
+        # 2. Match by selectedLayoutId == productId
+        if selected_layout_id:
+            for item in simple_items:
+                if isinstance(item, dict) and str(item.get('productId') or '') == selected_layout_id:
+                    return item
+
+        # 3. Fallback to single item if only 1 exists
+        if len(simple_items) == 1 and isinstance(simple_items[0], dict):
+            return simple_items[0]
+
+        return None
+
     def extract_bundle_products(self, response):
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if not json_script:
+        content = self.get_hypernova_content(response)
+        if not content:
             return
         try:
-            json_script = json_script.strip()
-            if json_script.startswith('<!--'):
-                json_script = json_script[4:]
-            if json_script.endswith('-->'):
-                json_script = json_script[:-3]
-            json_script = json_script.strip()
-            data = json.loads(json_script)
-            content = data.get('data', {}).get('content', {})
-
             # Deep-scan the entire content blob for any .htm URL
             # (skipping crossSell, breadcrumb, categoryTree, accordion, etc.)
             all_urls = self._collect_htm_urls(content, _skip_keys=self._EXCLUDED_URL_KEYS)
@@ -521,21 +583,8 @@ class ProductFetcher(Spider):
         item['Ref Highlights'] = self.extract_highlights(response)
         item['Ref Dimensions'] = self.extract_dimensions(response)
 
-        # Parse Hypernova script for our new fields
-        content = {}
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
-            try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                hypernova_data = json.loads(json_script)
-                content = hypernova_data.get('data', {}).get('content', {})
-            except Exception as e:
-                self.logger.error(f"Error parsing Hypernova script in parse_product_page: {e}")
+        # Parse Hypernova content for fields
+        content = self.get_hypernova_content(response)
 
         # 1. Product Type: read directly from productInfo.type (bundle/simple/configurable etc.)
         product_type = content.get('productInfo', {}).get('type', 'simple')
@@ -680,32 +729,11 @@ class ProductFetcher(Spider):
             return f"{secs}s"
        
     def extract_product_name(self, response):
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
-            try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                
-                data = json.loads(json_script)
-                content = data.get('data', {}).get('content', {})
-                product_layouts = content.get('productLayouts', {})
-                simple_items = product_layouts.get('simpleItems', [])
-                
-                current_url = response.url.rstrip('/')
-                
-                for item in simple_items:
-                    if isinstance(item, dict):
-                        item_url = item.get('url', '').rstrip('/')
-                        if item_url and item_url == current_url:
-                            name = item.get('name', '')
-                            if name:
-                                return name
-            except Exception as e:
-                self.logger.debug(f"Error extracting name from simpleItems: {e}")
+        selected_item = self._find_selected_simple_item(response)
+        if selected_item:
+            name = selected_item.get('name', '').strip()
+            if name:
+                return name
 
         selectors = [
             '//*[@id="contentId"]/div/div[1]/div[2]/div[2]/h1/text()'
@@ -716,89 +744,98 @@ class ProductFetcher(Spider):
         for script in response.xpath('//script[@type="application/ld+json"]/text()').getall():
             try:
                 data = json.loads(script)
-                if data.get('@type') == 'Product' or data.get('@type') == 'ProductGroup':
+                if data.get('@type') in ('Product', 'ProductGroup'):
                     offers = data.get('offers', {})
-                    if isinstance(offers, dict) and 'price' in offers:
+                    if isinstance(offers, dict) and 'price' in offers and offers['price']:
                         return str(offers['price'])
             except:
                 continue
+
+        selected_item = self._find_selected_simple_item(response)
+        if selected_item:
+            price_obj = selected_item.get('price', {})
+            if isinstance(price_obj, dict):
+                price_val = price_obj.get('sale') or price_obj.get('final') or price_obj.get('regular')
+                if price_val:
+                    return str(price_val)
+            elif price_obj:
+                return str(price_obj)
+
         return ''
     
     def extract_sku(self, response):
-        # Try to get SKU from simpleItems by matching URL
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
-            try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                
-                data = json.loads(json_script)
-                content = data.get('data', {}).get('content', {})
-                product_layouts = content.get('productLayouts', {})
-                simple_items = product_layouts.get('simpleItems', [])
-                
-                current_url = response.url.rstrip('/')
-                
-                for item in simple_items:
-                    if isinstance(item, dict):
-                        item_url = item.get('url', '').rstrip('/')
-                        if item_url and item_url == current_url:
-                            sku = item.get('sku', '')
-                            if sku:
-                                return sku
-            except Exception as e:
-                self.logger.debug(f"Error extracting SKU from simpleItems: {e}")
-        
+        content = self.get_hypernova_content(response)
+        selected_item = self._find_selected_simple_item(response, content)
+        if selected_item:
+            sku = selected_item.get('sku', '').strip()
+            if sku and 'ROOM' not in sku.upper() and 'HOST' not in sku.upper():
+                return sku
+
+        # Fallback to JSON-LD
+        sku = ''
         for script in response.xpath('//script[@type="application/ld+json"]/text()').getall():
             try:
                 data = json.loads(script)
-                if data.get('@type') == 'Product' or data.get('@type') == 'ProductGroup':
-                    return data.get('sku', '')
+                if data.get('@type') in ('Product', 'ProductGroup'):
+                    candidate = (data.get('sku', '') or '').strip()
+                    if candidate:
+                        sku = candidate
+                        break
             except:
                 continue
-        
-        return ''
+
+        # If SKU has ROOM or HOST, we MUST get the specific selected product's SKU
+        if not sku or 'ROOM' in sku.upper() or 'HOST' in sku.upper():
+            if selected_item:
+                selected_sku = selected_item.get('sku', '').strip()
+                if selected_sku:
+                    return selected_sku
+
+            # Check all simple items for a non-ROOM/non-HOST SKU
+            if content:
+                simple_items = content.get('productLayouts', {}).get('simpleItems', [])
+                for item in simple_items:
+                    if isinstance(item, dict):
+                        cand = item.get('sku', '').strip()
+                        if cand and 'ROOM' not in cand.upper() and 'HOST' not in cand.upper():
+                            return cand
+
+        return sku
     
     def extract_mpn(self, response):
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
-            try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                
-                data = json.loads(json_script)
-                content = data.get('data', {}).get('content', {})
-                product_layouts = content.get('productLayouts', {})
-                simple_items = product_layouts.get('simpleItems', [])
-                
-                current_url = response.url.rstrip('/')
-                
-                for item in simple_items:
-                    if isinstance(item, dict):
-                        item_url = item.get('url', '').rstrip('/')
-                        if item_url and item_url == current_url:
-                            sku = item.get('sku', '')
-                            if sku:
-                                return sku
-            except Exception as e:
-                self.logger.debug(f"Error extracting SKU from simpleItems: {e}")
+        content = self.get_hypernova_content(response)
+        selected_item = self._find_selected_simple_item(response, content)
+        if selected_item:
+            mpn = (selected_item.get('mpn') or selected_item.get('sku') or '').strip()
+            if mpn and 'ROOM' not in mpn.upper() and 'HOST' not in mpn.upper():
+                return mpn
 
+        mpn = ''
         for script in response.xpath('//script[@type="application/ld+json"]/text()').getall():
             try:
                 data = json.loads(script)
-                if data.get('@type') == 'Product' or data.get('@type') == 'ProductGroup':
-                    return data.get('mpn', '')
+                if data.get('@type') in ('Product', 'ProductGroup'):
+                    candidate = (data.get('mpn', '') or data.get('sku', '') or '').strip()
+                    if candidate:
+                        mpn = candidate
+                        break
             except:
                 continue
-        return ''
+
+        if not mpn or 'ROOM' in mpn.upper() or 'HOST' in mpn.upper():
+            if selected_item:
+                selected_mpn = (selected_item.get('mpn') or selected_item.get('sku') or '').strip()
+                if selected_mpn:
+                    return selected_mpn
+            if content:
+                simple_items = content.get('productLayouts', {}).get('simpleItems', [])
+                for item in simple_items:
+                    if isinstance(item, dict):
+                        cand = (item.get('mpn') or item.get('sku') or '').strip()
+                        if cand and 'ROOM' not in cand.upper() and 'HOST' not in cand.upper():
+                            return cand
+
+        return mpn
 
     def extract_gtin(self, response):
         return ''
@@ -818,42 +855,32 @@ class ProductFetcher(Spider):
         return ''
     
     def extract_main_image(self, response):
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
-            try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                
-                data = json.loads(json_script)
-                content = data.get('data', {}).get('content', {})
-                product_layouts = content.get('productLayouts', {})
-                simple_items = product_layouts.get('simpleItems', [])
-                
-                current_url = response.url.rstrip('/')
-                
-                for item in simple_items:
-                    if isinstance(item, dict):
-                        item_url = item.get('url', '').rstrip('/')
-                        if item_url and item_url == current_url:
-                            gallery = item.get('gallery', [])
-                            if isinstance(gallery, list) and gallery:
-                                for img in gallery:
-                                    if isinstance(img, dict):
-                                        original_url = img.get('original', '')
-                                        return original_url
-            except Exception as e:
-                self.logger.debug(f"Error extracting main image from simpleItems gallery: {e}")
+        selected_item = self._find_selected_simple_item(response)
+        if selected_item:
+            gallery = selected_item.get('gallery', [])
+            if isinstance(gallery, list) and gallery:
+                for img in gallery:
+                    if isinstance(img, dict):
+                        original_url = img.get('original', '')
+                        if original_url:
+                            return original_url
+            for img_key in ['defaultImage', 'imageUrl']:
+                img_url = selected_item.get(img_key, '')
+                if img_url:
+                    return img_url
+
         for script in response.xpath('//script[@type="application/ld+json"]/text()').getall():
             try:
                 data = json.loads(script)
-                if data.get('@type') == 'Product' or data.get('@type') == 'ProductGroup':
-                    return data.get('image', '')
+                if data.get('@type') in ('Product', 'ProductGroup'):
+                    images = data.get('image', [])
+                    if isinstance(images, list) and images:
+                        return images[0]
+                    elif isinstance(images, str):
+                        return images
             except:
                 continue
+        return ''
         return ''
     
     def extract_category(self, response):
@@ -914,32 +941,11 @@ class ProductFetcher(Spider):
         return ''
     
     def extract_product_id(self, response):
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
-            try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                
-                data = json.loads(json_script)
-                content = data.get('data', {}).get('content', {})
-                product_layouts = content.get('productLayouts', {})
-                simple_items = product_layouts.get('simpleItems', [])
-                
-                current_url = response.url.rstrip('/')
-                
-                for item in simple_items:
-                    if isinstance(item, dict):
-                        item_url = item.get('url', '').rstrip('/')
-                        if item_url and item_url == current_url:
-                            productId = item.get('productId', '')
-                            if productId:
-                                return productId
-            except Exception as e:
-                self.logger.debug(f"Error extracting productId from simpleItems: {e}")
+        selected_item = self._find_selected_simple_item(response)
+        if selected_item:
+            productId = selected_item.get('productId', '')
+            if productId:
+                return str(productId)
 
         product_id = response.xpath('//div[@data-id]/@data-id').get()        
         if product_id:
@@ -991,31 +997,10 @@ class ProductFetcher(Spider):
     
     def extract_main_images(self, response):
         image_urls = []
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if json_script:
+        content = self.get_hypernova_content(response)
+        if content:
             try:
-                json_script = json_script.strip()
-                if json_script.startswith('<!--'):
-                    json_script = json_script[4:]
-                if json_script.endswith('-->'):
-                    json_script = json_script[:-3]
-                json_script = json_script.strip()
-                
-                data = json.loads(json_script)
-                content = data.get('data', {}).get('content', {})
-                product_layouts = content.get('productLayouts', {})
-                simple_items = product_layouts.get('simpleItems', [])
-                
-                current_url = response.url.rstrip('/')
-                
-                matching_item = None
-                for item in simple_items:
-                    if isinstance(item, dict):
-                        item_url = item.get('url', '').rstrip('/')
-                        if item_url and item_url == current_url:
-                            matching_item = item
-                            break
-                
+                matching_item = self._find_selected_simple_item(response, content)
                 if matching_item:
                     gallery = matching_item.get('gallery', [])
                     if isinstance(gallery, list):
@@ -1029,8 +1014,6 @@ class ProductFetcher(Spider):
                             return '\n'.join(image_urls)
                 
                 if not image_urls:
-                    main_data = data.get('data', {})
-                    content = main_data.get('content', {})
                     gallery = content.get('gallery', [])
                     if isinstance(gallery, list):
                         for img in gallery:
@@ -1048,20 +1031,11 @@ class ProductFetcher(Spider):
         return '\n'.join(image_urls) if image_urls else ''
 
     def extract_dimensions(self, response):
-        json_script = response.xpath('//script[@data-hypernova-key="App"]/text()').get()
-        if not json_script:
+        content = self.get_hypernova_content(response)
+        if not content:
             return ''
         
-        json_script = json_script.strip()
-        if json_script.startswith('<!--'):
-            json_script = json_script[4:]
-        if json_script.endswith('-->'):
-            json_script = json_script[:-3]
-        json_script = json_script.strip()
-        
         try:
-            data = json.loads(json_script)
-            content = data.get('data', {}).get('content', {})
             setIncludes = content.get('setIncludes', {})
             
             result = {}

@@ -3,71 +3,93 @@ name: Discount Living Rooms - Scraper (DRL / TVS / DRO / BFD)
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: "Base site URL"
+      target_site:
+        description: "Target site to scrape"
+        type: choice
         required: true
-        default: "https://www.discountlivingrooms.com"
-      total_sitemaps:
-        description: "Total sitemaps to process (0 = auto)"
+        default: "ALL (All 4 Sites: DRL + BFD + DRO + TVSO)"
+        options:
+          - "ALL (All 4 Sites: DRL + BFD + DRO + TVSO)"
+          - "Discount Living Rooms (discountlivingrooms.com)"
+          - "Bedroom Furniture Discounts (bedroomfurniturediscounts.com)"
+          - "Dining Rooms Outlet (diningroomsoutlet.com)"
+          - "TV Stands Outlet (tvstandsoutlet.com)"
+      custom_url:
+        description: "Custom site URL (optional, overrides target selection if set)"
+        required: false
+        default: ""
+      sitemap_url:
+        description: "Custom sitemap URL override (optional, single site only)"
+        required: false
+        default: ""
+      urls_per_runner:
+        description: "Max product URLs to scrape per parallel runner"
+        default: "1500"
+      total_runners_per_site:
+        description: "Parallel runners per site (0 = auto-calculate based on URLs)"
         default: "0"
-      sitemaps_per_job:
-        description: "Sitemaps per parallel job"
-        default: "2"
-      urls_per_sitemap:
-        description: "Max URLs per sitemap"
-        default: "100"
+      max_total_urls:
+        description: "Max total URLs to scrape per site (0 = all / full)"
+        default: "0"
       max_workers:
         description: "Parallel requests per job"
-        default: "4"
+        default: "10"
       request_delay:
         description: "Delay between requests (seconds)"
-        default: "1.0"
+        default: "0.2"
+      total_sitemaps:
+        description: "Legacy: Total sitemaps (deprecated, auto-discovered)"
+        default: "0"
+      sitemaps_per_job:
+        description: "Legacy: Sitemaps per job (deprecated, now partitioned by URLs)"
+        default: "1"
+      urls_per_sitemap:
+        description: "Legacy: Max URLs per sitemap (0 = full scrape / unlimited)"
+        default: "0"
+
+env:
+  FTP_HOST: ${{ secrets.FTP_HOST || 'ftp-sandbox.1sb.pp.ua' }}
+  FTP_PORT: ${{ secrets.FTP_PORT || '21' }}
+  FTP_USER: ${{ secrets.FTP_USER || 'onestop_ftp-sandbox' }}
+  FTP_PASS: ${{ secrets.FTP_PASS || 'OneStop123' }}
+  FTP_PATH: ${{ secrets.FTP_PATH || '/scrap/' }}
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      site_name: ${{ steps.get_site_name.outputs.site_name }}
-    steps:
-      - name: Get site name from URL
-        id: get_site_name
-        run: |
-          URL="${{ github.event.inputs.url }}"
-          SITE_NAME=$(echo "$URL" | sed -E 's|https?://||;s|www\.||;s|\.[a-zA-Z]+(/.*)?$||;s|/.*||')
-          echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
+      matrix: ${{ steps.generate_matrix.outputs.matrix }}
 
-      - id: matrix
-        run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.url }}"
-
-          if [ "$TOTAL" -eq 0 ]; then
-            TOTAL=10
-          fi
-
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
-
-          MATRIX="["
-          for ((i=0;i<JOBS;i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
-          done
-          MATRIX="${MATRIX%,}]"
-
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-
-  scrape:
-    needs: plan
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    # Service container for Cloudflare bypass during sitemap discovery
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
+          done
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -77,31 +99,357 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
+
+      - name: Discover all sitemaps, count products, and partition runners
+        id: generate_matrix
+        env:
+          TARGET_SITE: ${{ github.event.inputs.target_site }}
+          CUSTOM_URL: ${{ github.event.inputs.custom_url }}
+          CUSTOM_SITEMAP: ${{ github.event.inputs.sitemap_url }}
+          URLS_PER_RUNNER: ${{ github.event.inputs.urls_per_runner }}
+          TOTAL_RUNNERS_PER_SITE: ${{ github.event.inputs.total_runners_per_site }}
+          MAX_TOTAL_URLS: ${{ github.event.inputs.max_total_urls }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          import sys
+          import json
+          import math
+          import subprocess
+          from urllib.parse import urlparse
+
+          target = os.environ.get("TARGET_SITE", "ALL")
+          custom_url = os.environ.get("CUSTOM_URL", "").strip()
+          custom_sitemap = os.environ.get("CUSTOM_SITEMAP", "").strip()
+          urls_per_runner = int(os.environ.get("URLS_PER_RUNNER", "1500") or "1500")
+          total_runners_input = int(os.environ.get("TOTAL_RUNNERS_PER_SITE", "0") or "0")
+          max_total_urls = int(os.environ.get("MAX_TOTAL_URLS", "0") or "0")
+
+          all_sites = [
+              {
+                  "site_key": "discountlivingrooms",
+                  "competitor": "DiscountLivingRooms",
+                  "url": "https://www.discountlivingrooms.com",
+                  "sitemap_url": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
+              },
+              {
+                  "site_key": "bedroomfurniturediscounts",
+                  "competitor": "Bedroomfurniturediscounts",
+                  "url": "https://www.bedroomfurniturediscounts.com",
+                  "sitemap_url": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap.xml",
+              },
+              {
+                  "site_key": "diningroomsoutlet",
+                  "competitor": "DiningRoomsOutlet",
+                  "url": "https://www.diningroomsoutlet.com",
+                  "sitemap_url": "https://www.diningroomsoutlet.com/sitemaps/sitemap_diningrooms.xml",
+              },
+              {
+                  "site_key": "tvstandsoutlet",
+                  "competitor": "TvStandsOutlet",
+                  "url": "https://www.tvstandsoutlet.com",
+                  "sitemap_url": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
+              },
+          ]
+
+          selected = []
+          if custom_url:
+              domain = urlparse(custom_url).netloc.replace("www.", "").split(".")[0] or "custom"
+              comp = domain.capitalize()
+              selected = [{
+                  "site_key": domain,
+                  "competitor": comp,
+                  "url": custom_url,
+                  "sitemap_url": custom_sitemap,
+              }]
+          elif "ALL" in target:
+              selected = all_sites
+          elif "bedroom" in target.lower():
+              selected = [s for s in all_sites if s["site_key"] == "bedroomfurniturediscounts"]
+          elif "dining" in target.lower():
+              selected = [s for s in all_sites if s["site_key"] == "diningroomsoutlet"]
+          elif "tv" in target.lower():
+              selected = [s for s in all_sites if s["site_key"] == "tvstandsoutlet"]
+          else:
+              selected = [s for s in all_sites if s["site_key"] == "discountlivingrooms"]
+
+          os.makedirs("url_chunks", exist_ok=True)
+          matrix_items = []
+
+          for s in selected:
+              site_key = s["site_key"]
+              competitor = s["competitor"]
+              site_url = s["url"]
+              site_sitemap = custom_sitemap if (custom_sitemap and len(selected) == 1) else s["sitemap_url"]
+              site_master_file = f"all_urls_{site_key}.txt"
+
+              print(f"\n============================================================")
+              print(f" Checking all sitemaps for site: {site_key} ({competitor})")
+              print(f" Base URL: {site_url}")
+              print(f" Sitemap: {site_sitemap}")
+              print(f"============================================================")
+
+              env_copy = os.environ.copy()
+              env_copy["CURR_URL"] = site_url
+              env_copy["SITE_NAME"] = site_key
+              env_copy["SITEMAP_URL"] = site_sitemap
+              env_copy["MASTER_URLS_FILE"] = site_master_file
+              env_copy["COLLECT_URLS_ONLY"] = "1"
+
+              res = subprocess.run([sys.executable, "drl/dlr_scraper.py"], env=env_copy)
+              if res.returncode != 0:
+                  print(f"⚠ Warning: URL collection for {site_key} returned code {res.returncode}")
+
+              if not os.path.exists(site_master_file):
+                  print(f"⚠ No URL file generated for {site_key}, creating empty file.")
+                  with open(site_master_file, "w") as f:
+                      pass
+
+              with open(site_master_file, "r", encoding="utf-8") as f:
+                  urls = [line.strip() for line in f if line.strip() and line.strip().startswith("http")]
+
+              site_total_urls = len(urls)
+              print(f"Total product URLs discovered for {site_key}: {site_total_urls:,}")
+
+              if max_total_urls > 0 and max_total_urls < site_total_urls:
+                  print(f"Limiting {site_key} to first {max_total_urls:,} URLs as requested")
+                  urls = urls[:max_total_urls]
+                  site_total_urls = len(urls)
+
+              if site_total_urls == 0:
+                  print(f"No URLs to process for {site_key}, skipping chunk generation.")
+                  continue
+
+              if total_runners_input > 0:
+                  site_chunks = total_runners_input
+                  urls_per_chunk = math.ceil(site_total_urls / site_chunks)
+              else:
+                  chunk_rate = urls_per_runner if urls_per_runner >= 100 else 1500
+                  site_chunks = math.ceil(site_total_urls / chunk_rate)
+                  urls_per_chunk = chunk_rate
+
+              # Cap runners per site to prevent exceeding GitHub matrix limits
+              max_per_site = 60 if len(selected) > 1 else 100
+              if site_chunks > max_per_site:
+                  print(f"Capping runners for {site_key} at {max_per_site} (would have been {site_chunks})")
+                  site_chunks = max_per_site
+                  urls_per_chunk = math.ceil(site_total_urls / site_chunks)
+
+              if site_chunks < 1:
+                  site_chunks = 1
+
+              for i in range(site_chunks):
+                  start_idx = i * urls_per_chunk
+                  end_idx = min(start_idx + urls_per_chunk, site_total_urls)
+                  chunk_urls = urls[start_idx:end_idx]
+                  if not chunk_urls:
+                      continue
+                  chunk_file = f"url_chunks/{site_key}_chunk_{i}.txt"
+                  with open(chunk_file, "w", encoding="utf-8") as cf:
+                      cf.write("\n".join(chunk_urls))
+                  matrix_items.append({
+                      "site_key": site_key,
+                      "competitor": competitor,
+                      "url": site_url,
+                      "sitemap_url": site_sitemap,
+                      "chunk_index": i,
+                      "total_chunks": site_chunks,
+                      "chunk_file": chunk_file,
+                      "url_count": len(chunk_urls),
+                  })
+
+              print(f"Divided {site_total_urls:,} URLs for {site_key} into {site_chunks} runners (~{urls_per_chunk:,} URLs/runner)")
+
+          if not matrix_items:
+              print("No matrix items generated, creating fallback job.")
+              matrix_items.append({
+                  "site_key": "discountlivingrooms",
+                  "competitor": "DiscountLivingRooms",
+                  "url": "https://www.discountlivingrooms.com",
+                  "sitemap_url": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
+                  "chunk_index": 0,
+                  "total_chunks": 1,
+                  "chunk_file": "",
+                  "url_count": 0,
+              })
+
+          matrix_json = json.dumps(matrix_items)
+          print(f"Total planned jobs across all sites: {len(matrix_items)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={matrix_json}\n")
+          EOF
+
+      - name: Upload URL chunks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlr_url_chunks
+          path: url_chunks/*.txt
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Upload master URL lists artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlr_all_sitemap_urls
+          path: all_urls_*.txt
+          retention-days: 2
+          if-no-files-found: warn
+
+  scrape:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    name: "Scrape (${{ matrix.site_key }} - chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }} [${{ matrix.url_count }} URLs])"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
+
+      - name: Download URL chunks
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: dlr_url_chunks
+          path: url_chunks
 
       - name: Run scraper
         env:
           CURR_URL: ${{ matrix.url }}
-          SITEMAP_OFFSET: ${{ matrix.offset }}
-          MAX_SITEMAPS: ${{ matrix.limit }}
+          SITE_NAME: ${{ matrix.site_key }}
+          SITEMAP_URL: ${{ matrix.sitemap_url }}
+          URLS_FILE: ${{ matrix.chunk_file }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
+          TOTAL_CHUNKS: ${{ matrix.total_chunks }}
+          SITEMAP_OFFSET: ${{ matrix.chunk_index }}
+          MAX_SITEMAPS: 1
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+          FLARESOLVERR_TIMEOUT: "120"
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          FTP_SYNC_ITEMS: "100"
         run: |
-          python drl/dlr_scraper.py
+          echo "Starting scraper for ${{ matrix.site_key }} (chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }}):"
+          echo "URLS_FILE: ${{ matrix.chunk_file }} (${{ matrix.url_count }} URLs)"
+          python drl/dlr_scraper.py || echo "Scraper finished with exit code $?"
 
-      - name: Upload chunk
+      - name: Rescue remaining chunk data to FTP on exit
+        if: always()
+        env:
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          SITE_KEY: ${{ matrix.site_key }}
+          COMPETITOR: ${{ matrix.competitor }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
+        run: |
+          python3 - << 'EOF'
+          import os, glob, sys
+          from datetime import datetime, timezone
+          sys.path.insert(0, ".")
+          from ftp_manager import FTPManager, normalize_competitor_name
+
+          host = os.environ.get("FTP_HOST", "").strip()
+          user = os.environ.get("FTP_USER", "").strip()
+          pass_ = os.environ.get("FTP_PASS", "").strip()
+          port = int(os.environ.get("FTP_PORT", "21"))
+          base_path = os.environ.get("FTP_PATH", "/scrap/").strip()
+          site_key = os.environ.get("SITE_KEY", "").strip()
+          comp = os.environ.get("COMPETITOR", "").strip() or normalize_competitor_name(site_key)
+          date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+          if not host or not user or not pass_:
+              print("No FTP configured, skipping rescue upload.")
+              sys.exit(0)
+
+          csvs = glob.glob(f"products_{site_key}_chunk_*.csv") + glob.glob("products_chunk_*.csv")
+          txts = glob.glob(f"url_list_{site_key}_chunk_*.txt") + glob.glob("url_list_chunk_*.txt")
+
+          target_files = [f for f in set(csvs + txts) if os.path.exists(f) and os.path.getsize(f) > 0]
+          if not target_files:
+              print("No chunk files found to rescue.")
+              sys.exit(0)
+
+          print(f"Rescuing {len(target_files)} chunk file(s) to FTP for {comp}...")
+          ftp = FTPManager(host=host, user=user, pass_=pass_, port=port, base_dir=base_path)
+          remote_temp_dir = f"{base_path.rstrip('/')}/{comp}/{date_str}/output/temp"
+
+          for local_f in target_files:
+              remote_f = f"{remote_temp_dir}/{os.path.basename(local_f)}"
+              ftp.upload_file(local_f, remote_f)
+
+          ftp.disconnect()
+          print("Rescue upload step complete.")
+          EOF
+
+      - name: Upload chunk (even on failure)
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: chunk_${{ matrix.offset }}
+          name: chunk_${{ matrix.site_key }}_${{ matrix.chunk_index }}
           path: |
+            products_*_chunk_*.csv
             products_chunk_*.csv
+            url_list_*_chunk_*.txt
             url_list_chunk_*.txt
           if-no-files-found: warn
 
   merge:
     needs: [plan, scrape]
+    if: always() && !cancelled() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -119,73 +467,125 @@ jobs:
           pattern: chunk_*
           merge-multiple: true
 
-      - name: Merge CSV chunks
-        id: merge_csv
-        run: |
-          CSV_FILES=$(find chunks -name "products_chunk_*.csv" 2>/dev/null)
-          FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
-          head -n 1 "$FIRST_FILE" > products_full.csv
-          for f in $CSV_FILES; do
-            tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> products_full.csv
-          done
+      - name: Download master URL lists
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: dlr_all_sitemap_urls
+          path: master_urls
 
-      - name: Build output filename
-        id: meta
-        run: |
-          SITE_NAME="${{ needs.plan.outputs.site_name }}"
-          [ -z "$SITE_NAME" ] && SITE_NAME="site"
-          DATE=$(date +%F_%H%M%S)
-          echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
-          mv products_full.csv "${SITE_NAME}_${DATE}.csv"
-
-
-      - name: Merge per-chunk URL lists
-        id: merge_urls
-        run: |
-          find chunks -name "url_list_chunk_*.txt" 2>/dev/null | sort | xargs cat 2>/dev/null | sort -u > all_sitemap_urls.txt || true
-          URL_COUNT=$(wc -l < all_sitemap_urls.txt | tr -d ' ')
-          echo "Total unique sitemap URLs: $URL_COUNT"
-          echo "url_count=$URL_COUNT" >> $GITHUB_OUTPUT
-
-      - name: Build FTP directory structure
-        id: ftp_structure
+      - name: Process each site (Merge CSV, Track URLs, Prepare FTP)
+        id: process_sites
         run: |
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
-          COMPETITOR="Discountlivingrooms"
+          FILE_DATE=$(date +%F_%H%M%S)
 
-          echo "competitor=$COMPETITOR" >> $GITHUB_OUTPUT
-          echo "date_str=$DATE" >> $GITHUB_OUTPUT
-          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Listing all downloaded chunk files:"
+          find chunks -type f | sort
 
-          mkdir -p "ftp_output/${COMPETITOR}/${DATE}/input"
-          mkdir -p "ftp_output/${COMPETITOR}/${DATE}/output/temp"
-
-          cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
-          cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp drl_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
-
-          echo "FTP structure:"
-          find ftp_output -type f | sort
-
-      - name: Generate FinalURLListForScrap
-        run: |
-          COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
-          DATE="${{ steps.ftp_structure.outputs.date_str }}"
-          TIMESTAMP="${{ steps.ftp_structure.outputs.timestamp }}"
-
-          SCRAPED="ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv"
-          URLS="ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv"
-          OUT="ftp_output/${COMPETITOR}/${DATE}/output/FinalURLListForScrap${TIMESTAMP}.csv"
-
-          if [ -f "$URLS" ] && [ -f "$SCRAPED" ]; then
-            python3 ftp_manager.py track-urls --sitemap-file "$URLS" --scraped-file "$SCRAPED" --output-file "$OUT"
-            echo "Generated FinalURLListForScrap: $OUT"
+          # Detect all site keys present in chunks
+          SITE_KEYS=$(find chunks -name "products_*_chunk_*.csv" | sed -E 's|.*/products_([^_]+)_chunk_.*|\1|' | sort -u)
+          if [ -z "$SITE_KEYS" ]; then
+            SITE_KEYS="discountlivingrooms"
           fi
 
-      - name: Archive results
+          echo "Sites detected for processing: $SITE_KEYS"
+
+          for SITE in $SITE_KEYS; do
+            echo ""
+            echo "════════════════════════════════════════════════════════════"
+            echo " Processing Site: $SITE"
+            echo "════════════════════════════════════════════════════════════"
+
+            # 1. Merge CSV chunks
+            SITE_CSVS=$(find chunks -name "products_${SITE}_chunk_*.csv" 2>/dev/null)
+            if [ -z "$SITE_CSVS" ]; then
+              SITE_CSVS=$(find chunks -name "products_chunk_*.csv" 2>/dev/null)
+            fi
+
+            OUTPUT_FILE="${SITE}_${FILE_DATE}.csv"
+            if [ -n "$SITE_CSVS" ]; then
+              FIRST_FILE=$(echo "$SITE_CSVS" | head -n 1)
+              head -n 1 "$FIRST_FILE" > "$OUTPUT_FILE"
+              for f in $SITE_CSVS; do
+                tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> "$OUTPUT_FILE"
+              done
+              ROW_COUNT=$(wc -l < "$OUTPUT_FILE" | tr -d ' ')
+              echo "✓ Merged $OUTPUT_FILE ($ROW_COUNT rows)"
+            else
+              echo "⚠ No CSV chunks found for $SITE"
+              touch "$OUTPUT_FILE"
+            fi
+
+            # 2. Merge URL list
+            URL_FILE="all_sitemap_urls_${SITE}.txt"
+            if [ -f "master_urls/all_urls_${SITE}.txt" ]; then
+              cp "master_urls/all_urls_${SITE}.txt" "$URL_FILE"
+            else
+              SITE_URLS=$(find chunks -name "url_list_${SITE}_chunk_*.txt" 2>/dev/null)
+              if [ -z "$SITE_URLS" ]; then
+                SITE_URLS=$(find chunks -name "url_list_chunk_*.txt" 2>/dev/null)
+              fi
+              if [ -n "$SITE_URLS" ]; then
+                cat $SITE_URLS | sort -u > "$URL_FILE"
+              else
+                touch "$URL_FILE"
+              fi
+            fi
+            URL_COUNT=$(wc -l < "$URL_FILE" | tr -d ' ')
+            echo "✓ Unique sitemap URLs for $SITE: $URL_COUNT"
+
+            # 3. Determine Competitor name for FTP
+            case "$SITE" in
+              bedroomfurniturediscounts) COMPETITOR="Bedroomfurniturediscounts" ;;
+              diningroomsoutlet)         COMPETITOR="DiningRoomsOutlet" ;;
+              tvstandsoutlet)            COMPETITOR="TvStandsOutlet" ;;
+              *)                         COMPETITOR="DiscountLivingRooms" ;;
+            esac
+
+            # 4. Prepare standard FTP directory structure
+            INPUT_DIR="ftp_output/${COMPETITOR}/${DATE}/input"
+            TEMP_DIR="ftp_output/${COMPETITOR}/${DATE}/output/temp"
+            FINAL_DIR="ftp_output/${COMPETITOR}/${DATE}/output"
+
+            mkdir -p "$INPUT_DIR" "$TEMP_DIR" "$FINAL_DIR"
+
+            INPUT_URL="$INPUT_DIR/URLList${TIMESTAMP}.csv"
+            TEMP_URL="$TEMP_DIR/URLListForScrap${TIMESTAMP}.csv"
+            FINAL_SCRAPED="$FINAL_DIR/FinalScrappedData${TIMESTAMP}.csv"
+            FINAL_URL="$FINAL_DIR/FinalURLListForScrap${TIMESTAMP}.csv"
+
+            cp "$URL_FILE" "$INPUT_URL" 2>/dev/null || true
+            cp "$URL_FILE" "$TEMP_URL" 2>/dev/null || true
+            cp "$OUTPUT_FILE" "$FINAL_SCRAPED" 2>/dev/null || true
+
+            # 5. Generate FinalURLListForScrap (Scraped vs Not Scraped tracking)
+            if [ -f "$TEMP_URL" ] && [ -f "$FINAL_SCRAPED" ] && [ -s "$FINAL_SCRAPED" ]; then
+              python3 ftp_manager.py track-urls --sitemap-file "$TEMP_URL" --scraped-file "$FINAL_SCRAPED" --output-file "$FINAL_URL" || true
+            fi
+
+            # 6. Upload to FTP server if configured
+            if [ -n "$FTP_HOST" ]; then
+              echo "Uploading $COMPETITOR output to FTP server..."
+              python3 ftp_manager.py upload -c "$COMPETITOR" -b ftp_output || {
+                echo "ftp_manager upload failed, falling back to lftp..."
+                which lftp >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y lftp)
+                BASE="${FTP_PATH}/${COMPETITOR}/${DATE}"
+                lftp -e "set ftp:ssl-allow no; mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}; bye" -u "$FTP_USER","$FTP_PASS" -p "${FTP_PORT:-21}" "$FTP_HOST" || true
+                echo "FTP upload complete: ${BASE}"
+              } || true
+            fi
+          done
+
+          echo ""
+          echo "FTP Output structure created:"
+          find ftp_output -type f | sort
+
+      - name: Archive separate CSV results per site
         uses: actions/upload-artifact@v4
         with:
-          name: final_results
-          path: ${{ steps.meta.outputs.name }}
+          name: site_products_csvs
+          path: "*_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*.csv"
           retention-days: 7
+          if-no-files-found: warn

@@ -5,30 +5,112 @@ import sys
 import gc
 import threading
 import requests
+import random
 import re
 import json
 import html
 import ast
-from typing import Optional, List, Dict
+import shutil
+import signal
+import urllib3
+from typing import Optional, List, Dict, Any, Tuple
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+
+# Add repository root for shared imports like ftp_manager
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+try:
+    from ftp_manager import FTPManager, normalize_competitor_name
+    HAS_FTP_MANAGER = True
+except Exception:
+    HAS_FTP_MANAGER = False
+
+# ================= BYPASS MODULES =================
+
+try:
+    from curl_cffi import requests as cc_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
+
+try:
+    from colemanfurniture_brand_file_scraper.utils.proxy_manager import ProxyManager
+    HAS_PROXY_MANAGER = True
+except Exception:
+    HAS_PROXY_MANAGER = False
 
 # ================= ENV =================
 
 CURR_URL = os.getenv("CURR_URL", "https://www.discountlivingrooms.com").rstrip("/")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://www.overstock.com/api/product")
+SITEMAP_URL = os.getenv("SITEMAP_URL", "").strip()
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
+CHUNK_INDEX = int(os.getenv("CHUNK_INDEX", str(SITEMAP_OFFSET)))
+TOTAL_CHUNKS = int(os.getenv("TOTAL_CHUNKS", "0"))
+URLS_FILE = os.getenv("URLS_FILE", "").strip()
+COLLECT_URLS_ONLY = os.getenv("COLLECT_URLS_ONLY", "").strip().lower() in ("1", "true", "yes")
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
+PROXY_ENV = os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("SITEMAP_PROXY") or ""
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
+FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 
-OUTPUT_CSV = f"products_chunk_{SITEMAP_OFFSET}.csv"
+# FTP Configuration for periodic data streaming
+FTP_HOST = os.getenv("FTP_HOST", "").strip()
+FTP_PORT = int(os.getenv("FTP_PORT", "21"))
+FTP_USER = os.getenv("FTP_USER", "").strip()
+FTP_PASS = os.getenv("FTP_PASS", "").strip()
+FTP_PATH = os.getenv("FTP_PATH", "/scrap/").strip()
+FTP_SYNC_ITEMS = int(os.getenv("FTP_SYNC_ITEMS", "100"))      # Upload to FTP strictly per 100 items
+
+# Known sitemaps for the 4 sister domains
+SITE_SITEMAPS = {
+    "discountlivingrooms.com": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
+    "bedroomfurniturediscounts.com": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap.xml",
+    "diningroomsoutlet.com": "https://www.diningroomsoutlet.com/sitemaps/sitemap_diningrooms.xml",
+    "tvstandsoutlet.com": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
+}
+
+SITE_COMPETITORS = {
+    "discountlivingrooms": "DiscountLivingRooms",
+    "bedroomfurniturediscounts": "Bedroomfurniturediscounts",
+    "diningroomsoutlet": "DiningRoomsOutlet",
+    "tvstandsoutlet": "TvStandsOutlet",
+}
+
+SITE_NAME = os.getenv("SITE_NAME", "").strip().lower()
+if not SITE_NAME:
+    parsed_netloc = urlparse(CURR_URL).netloc.replace("www.", "").split(".")[0]
+    SITE_NAME = parsed_netloc or "discountlivingrooms"
+
+COMPETITOR_NAME = SITE_COMPETITORS.get(
+    SITE_NAME,
+    normalize_competitor_name(SITE_NAME) if HAS_FTP_MANAGER else SITE_NAME.capitalize()
+)
+DATE_DIR = datetime.now(timezone.utc).strftime("%Y%m%d")
+REMOTE_TEMP_DIR = f"{FTP_PATH.rstrip('/')}/{COMPETITOR_NAME}/{DATE_DIR}/output/temp"
+
+OUTPUT_CSV = f"products_{SITE_NAME}_chunk_{CHUNK_INDEX}.csv"
+URL_LIST_FILE = f"url_list_{SITE_NAME}_chunk_{CHUNK_INDEX}.txt"
+REMOTE_TEMP_CSV = f"{REMOTE_TEMP_DIR}/{OUTPUT_CSV}"
+REMOTE_TEMP_URLS = f"{REMOTE_TEMP_DIR}/{URL_LIST_FILE}"
 SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+MASTER_URLS_FILE = os.getenv("MASTER_URLS_FILE", f"all_urls_{SITE_NAME}.txt").strip()
 
 # ================= LOGGER =================
 
@@ -37,84 +119,460 @@ def log(msg: str, level: str = "INFO"):
     sys.stderr.write(f"[{timestamp}] [{level}] {msg}\n")
     sys.stderr.flush()
 
-# ================= HTTP SESSION =================
+# ================= PERIODIC FTP UPLOADER =================
 
-session = requests.Session()
-# Add default headers to session for all requests
-session.headers.update({
-    # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    # "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-})
-def get_sitemap_from_robots_txt():
-    try:
-        # Construct robots.txt URL
-        robots_url = f"{CURR_URL}/robots.txt"
-        
-        # Fetch the robots.txt content
-        response = requests.get(robots_url, timeout=10)
-        response.raise_for_status()
-     
-        # Extract Sitemap URL
-        sitemap_url = None
-        for line in response.text.split('\n'):
-            if line.lower().startswith('sitemap:'):
-                sitemap_url = line.split(':', 1)[1].strip()
-                break
-        
-        if sitemap_url:
-            print(f"Extracted Sitemap URL: {sitemap_url}")
-            return sitemap_url
+csv_file_handle = None
+uploader: Optional['PeriodicFTPUploader'] = None
+
+class PeriodicFTPUploader:
+    """Streams data to FTP every N records and flushes on interruption/failure."""
+    def __init__(self, local_csv: str, remote_csv: str, local_urls: str = "", remote_urls: str = "", sync_items: int = 100):
+        self.local_csv = local_csv
+        self.remote_csv = remote_csv
+        self.local_urls = local_urls
+        self.remote_urls = remote_urls
+        self.sync_items = sync_items
+        self.last_sync_count = 0
+        self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ftp_sync")
+        self.is_uploading = False
+        self.ftp_enabled = bool(HAS_FTP_MANAGER and FTP_HOST and FTP_USER and FTP_PASS)
+        if self.ftp_enabled:
+            log(f"[FTP-STREAM] Streaming enabled -> {self.remote_csv} (every {self.sync_items} records)")
         else:
-            print("No Sitemap directive found in robots.txt")
-            return None
-            
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching robots.txt: {e}")
+            log("[FTP-STREAM] FTP credentials not supplied; periodic streaming disabled.")
+
+    def on_item_scraped(self, current_count: int, file_handle=None, force: bool = False):
+        if file_handle:
+            try:
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            except Exception:
+                pass
+
+        if not self.ftp_enabled:
+            return
+
+        items_diff = current_count - self.last_sync_count
+        if force or (items_diff >= self.sync_items):
+            self.trigger_sync(current_count)
+
+    def trigger_sync(self, current_count: int = 0):
+        if not self.ftp_enabled:
+            return
+        with self.lock:
+            if self.is_uploading:
+                return
+            self.is_uploading = True
+            if current_count:
+                self.last_sync_count = current_count
+
+        self.executor.submit(self._run_upload)
+
+    def _run_upload(self):
+        try:
+            temp_snapshot = f"{self.local_csv}.upload_snap"
+            if os.path.exists(self.local_csv) and os.path.getsize(self.local_csv) > 0:
+                shutil.copyfile(self.local_csv, temp_snapshot)
+                ftp = FTPManager(FTP_HOST, FTP_USER, FTP_PASS, FTP_PORT, FTP_PATH)
+                try:
+                    ftp.connect()
+                    ftp.upload_file(temp_snapshot, self.remote_csv)
+                    if self.local_urls and os.path.exists(self.local_urls) and self.remote_urls:
+                        ftp.upload_file(self.local_urls, self.remote_urls)
+                    log(f"[FTP-STREAM] Periodic sync uploaded to {self.remote_csv}", "INFO")
+                finally:
+                    ftp.disconnect()
+                if os.path.exists(temp_snapshot):
+                    os.remove(temp_snapshot)
+        except Exception as e:
+            log(f"[FTP-STREAM] Warning during periodic upload: {e}", "WARNING")
+        finally:
+            with self.lock:
+                self.is_uploading = False
+
+    def shutdown(self, current_count: int = 0, file_handle=None):
+        if file_handle:
+            try:
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            except Exception:
+                pass
+        self.executor.shutdown(wait=True)
+        if self.ftp_enabled and os.path.exists(self.local_csv) and os.path.getsize(self.local_csv) > 0:
+            log(f"[FTP-STREAM] Performing final flush of remaining data to {self.remote_csv}...", "INFO")
+            try:
+                ftp = FTPManager(FTP_HOST, FTP_USER, FTP_PASS, FTP_PORT, FTP_PATH)
+                try:
+                    ftp.connect()
+                    ftp.upload_file(self.local_csv, self.remote_csv)
+                    if self.local_urls and os.path.exists(self.local_urls) and self.remote_urls:
+                        ftp.upload_file(self.local_urls, self.remote_urls)
+                    log(f"[FTP-STREAM] Final flush successfully uploaded to {self.remote_csv}", "INFO")
+                finally:
+                    ftp.disconnect()
+            except Exception as e:
+                log(f"[FTP-STREAM] Error during final flush: {e}", "ERROR")
+
+def handle_interrupt(signum, frame):
+    log(f"Process received signal {signum}. Flushing remaining data to FTP...", "WARNING")
+    if uploader:
+        uploader.shutdown(file_handle=csv_file_handle)
+    sys.exit(128 + signum)
+
+try:
+    signal.signal(signal.SIGTERM, handle_interrupt)
+    signal.signal(signal.SIGINT, handle_interrupt)
+except Exception:
+    pass
+
+# ================= BYPASS & HTTP SESSION =================
+
+class BypassSession:
+    """Multi-tiered HTTP client designed to handle Cloudflare and WAF protections."""
+    def __init__(self):
+        self.proxy = PROXY_ENV
+        self.flaresolverr_lock = threading.Lock()
+        self.flaresolverr_session_id = None
+        self.clearance_cookies = {}
+        self.proxy_manager = None
+        if not self.proxy and HAS_PROXY_MANAGER:
+            try:
+                self.proxy_manager = ProxyManager()
+            except Exception:
+                self.proxy_manager = None
+
+        self.scraper = None
+        if HAS_CLOUDSCRAPER:
+            try:
+                self.scraper = cloudscraper.create_scraper(
+                    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+                    delay=10
+                )
+            except Exception as e:
+                log(f"Failed to initialize cloudscraper: {e}", "WARNING")
+
+        self.session = requests.Session()
+        self.browser_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Ch-Ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Connection": "keep-alive",
+        }
+        self.session.headers.update(self.browser_headers)
+
+    def _get_proxies_dict(self):
+        p = self.proxy
+        if not p and self.proxy_manager:
+            try:
+                if hasattr(self.proxy_manager, 'get_proxy'):
+                    p = self.proxy_manager.get_proxy(CURR_URL)
+                elif hasattr(self.proxy_manager, 'get_proxy_for_homegallery'):
+                    p = self.proxy_manager.get_proxy_for_homegallery()
+            except Exception:
+                p = None
+        if p:
+            return {"http": p, "https": p}
         return None
 
-def http_get(url: str, is_json: bool = False) -> Optional[str]:
-    """HTTP GET request with different headers for sitemap vs API requests"""
-    for attempt in range(3):
+    def _rotate_proxy(self):
+        if self.proxy_manager:
+            if hasattr(self.proxy_manager, 'mark_proxy_failed') and self.proxy:
+                self.proxy_manager.mark_proxy_failed(self.proxy)
+            try:
+                if hasattr(self.proxy_manager, 'get_proxy'):
+                    self.proxy = self.proxy_manager.get_proxy(CURR_URL)
+                elif hasattr(self.proxy_manager, 'get_proxy_for_homegallery'):
+                    self.proxy = self.proxy_manager.get_proxy_for_homegallery()
+                log(f"Rotated proxy to: {self.proxy}", "DEBUG")
+            except Exception:
+                pass
+
+    def _is_challenge(self, text: str) -> bool:
+        if not text:
+            return False
+        sample = text[:2000].lower()
+        return ("<title>just a moment...</title>" in sample or 
+                "challenge-platform" in sample or 
+                "cf-turnstile" in sample or
+                "human verification" in sample or
+                "please wait..." in sample)
+
+    def _init_flaresolverr_session(self):
+        if not FLARESOLVERR_URL:
+            return
+        endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
         try:
-            if is_json:
-                # For API/JSON requests, override with JSON-specific headers
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": f"{CURR_URL}/",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-origin",
-                }
-                r = session.get(url, headers=headers, timeout=15, verify=True)
-            else:
-                # For sitemap/XML requests, use default session headers (already set)
-                r = session.get(url, timeout=15, verify=True)
-                
-            if r.status_code == 200:
-                log(f"Success fetching {url}", "DEBUG")
-                return r.text
-            else:
-                log(f"Status {r.status_code} for {url}", "WARNING")
-                if r.status_code == 429:  # Rate limited
-                    time.sleep(5)
-        except requests.exceptions.Timeout:
-            log(f"Timeout on attempt {attempt+1} for {url}", "WARNING")
-            time.sleep(2)
+            payload = {"cmd": "sessions.create"}
+            if self.proxy:
+                payload["proxy"] = {"url": self.proxy}
+            res = requests.post(endpoint, json=payload, timeout=20)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "ok":
+                    self.flaresolverr_session_id = data.get("session")
+                    log(f"Created FlareSolverr session: {self.flaresolverr_session_id}", "DEBUG")
         except Exception as e:
-            log(f"Attempt {attempt+1} failed for {url}: {type(e).__name__}", "WARNING")
-            time.sleep(1)
+            log(f"Could not create persistent FlareSolverr session: {e}", "DEBUG")
+
+    def _fetch_flaresolverr(self, url: str, timeout: int = 120) -> Optional[str]:
+        if not FLARESOLVERR_URL:
+            return None
+
+        with self.flaresolverr_lock:
+            # Check if clearance cookies were refreshed by another thread while waiting for lock
+            if self.clearance_cookies.get("cf_clearance") and HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        url,
+                        headers=dict(self.browser_headers),
+                        cookies=self.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=self._get_proxies_dict(),
+                        timeout=20,
+                        verify=False
+                    )
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        return resp.text
+                except Exception:
+                    pass
+
+            endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
+
+            # Ensure session exists
+            if not self.flaresolverr_session_id:
+                self._init_flaresolverr_session()
+
+            for attempt in range(2):
+                try:
+                    log(f"Requesting {url} via FlareSolverr (timeout={timeout}s, attempt={attempt+1})...", "DEBUG")
+                    payload = {
+                        "cmd": "request.get",
+                        "url": url,
+                        "maxTimeout": timeout * 1000,
+                    }
+                    if self.flaresolverr_session_id:
+                        payload["session"] = self.flaresolverr_session_id
+                    if self.proxy:
+                        payload["proxy"] = {"url": self.proxy}
+
+                    res = requests.post(endpoint, json=payload, timeout=timeout + 20)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("status") == "ok":
+                            solution = data.get("solution", {})
+                            resp_text = solution.get("response", "")
+
+                            # Save cookies and userAgent for direct fast requests
+                            cookies = solution.get("cookies", [])
+                            for cookie in cookies:
+                                c_name = cookie.get("name")
+                                c_val = cookie.get("value")
+                                if c_name and c_val:
+                                    self.clearance_cookies[c_name] = c_val
+                                    self.session.cookies.set(c_name, c_val, domain=cookie.get("domain", ""))
+
+                            user_agent = solution.get("userAgent")
+                            if user_agent:
+                                self.browser_headers["User-Agent"] = user_agent
+                                self.session.headers["User-Agent"] = user_agent
+
+                            if solution.get("status") == 200 and not self._is_challenge(resp_text):
+                                log(f"Success fetching {url} via FlareSolverr", "DEBUG")
+                                return resp_text
+                            else:
+                                log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
+                        else:
+                            log(f"FlareSolverr message: {data.get('message')}", "WARNING")
+                            self.flaresolverr_session_id = None
+                except Exception as e:
+                    log(f"FlareSolverr attempt {attempt+1} error for {url}: {e}", "WARNING")
+                    self.flaresolverr_session_id = None
+
+                time.sleep(3)
+
+            return None
+
+    def fetch(self, url: str, is_json: bool = False, max_retries: int = 3, timeout: int = 25) -> Optional[str]:
+        if not url or not isinstance(url, str) or not url.startswith("http"):
+            return None
+
+        proxies = self._get_proxies_dict()
+        headers = dict(self.browser_headers)
+        if is_json:
+            headers.update({
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{CURR_URL}/",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            })
+
+        # Fast Strategy 1: Direct curl_cffi with Chrome TLS impersonation (with or without cf_clearance)
+        if HAS_CURL_CFFI:
+            for imp in ["chrome124", "chrome120"]:
+                try:
+                    resp = cc_requests.get(
+                        url,
+                        headers=headers,
+                        cookies=self.clearance_cookies,
+                        impersonate=imp,
+                        proxies=proxies,
+                        timeout=timeout,
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        log(f"Fast direct curl_cffi ({imp}) request succeeded for {url}", "DEBUG")
+                        return resp.text
+                    elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
+                        log(f"curl_cffi ({imp}) challenged/blocked on {url}", "DEBUG")
+                        if "cf_clearance" in self.clearance_cookies:
+                            self.clearance_cookies.pop("cf_clearance", None)
+                        break
+                except Exception as e:
+                    log(f"curl_cffi ({imp}) error for {url}: {e}", "DEBUG")
+
+        # Fast Strategy 2: If we have clearance cookies, try requests.Session
+        if self.clearance_cookies.get("cf_clearance"):
+            try:
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
+                if resp.status_code == 200 and not self._is_challenge(resp.text):
+                    log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
+                    return resp.text
+                elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
+                    self.clearance_cookies.pop("cf_clearance", None)
+            except Exception as e:
+                log(f"Fast direct session request failed: {e}", "DEBUG")
+
+        # Fallback Strategy: If FlareSolverr is configured and direct request was blocked or failed
+        if FLARESOLVERR_URL:
+            fs_timeout = max(timeout, FLARESOLVERR_TIMEOUT)
+            content = self._fetch_flaresolverr(url, timeout=fs_timeout)
+            if content:
+                return content
+
+        for attempt in range(max_retries):
+            proxies = self._get_proxies_dict()
+
+            # Strategy 1: curl_cffi with browser impersonation
+            if HAS_CURL_CFFI:
+                for imp in ["chrome124", "chrome120", "chrome110"]:
+                    try:
+                        resp = cc_requests.get(
+                            url,
+                            headers=headers,
+                            impersonate=imp,
+                            proxies=proxies,
+                            timeout=timeout,
+                            verify=False
+                        )
+                        if resp.status_code == 200 and not self._is_challenge(resp.text):
+                            log(f"Success fetching {url} via curl_cffi ({imp})", "DEBUG")
+                            return resp.text
+                        elif resp.status_code in [403, 429, 503] or self._is_challenge(resp.text):
+                            log(f"curl_cffi ({imp}) blocked (status {resp.status_code}) on {url}", "DEBUG")
+                    except Exception as e:
+                        log(f"curl_cffi ({imp}) error for {url}: {type(e).__name__}", "DEBUG")
+
+            # Strategy 2: cloudscraper
+            if self.scraper:
+                try:
+                    resp = self.scraper.get(url, headers=headers, proxies=proxies, timeout=timeout)
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        log(f"Success fetching {url} via cloudscraper", "DEBUG")
+                        return resp.text
+                    elif resp.status_code in [403, 429, 503] or self._is_challenge(resp.text):
+                        log(f"cloudscraper blocked (status {resp.status_code}) for {url}", "DEBUG")
+                except Exception as e:
+                    log(f"cloudscraper error for {url}: {type(e).__name__}", "DEBUG")
+
+            # Strategy 3: Standard requests with browser headers & proxy
+            try:
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=timeout, verify=False)
+                if resp.status_code == 200 and not self._is_challenge(resp.text):
+                    log(f"Success fetching {url} via requests", "DEBUG")
+                    return resp.text
+                elif resp.status_code in [403, 429, 503] or self._is_challenge(resp.text):
+                    log(f"requests status {resp.status_code} for {url}", "WARNING")
+                    self._rotate_proxy()
+            except Exception as e:
+                log(f"requests error for {url}: {type(e).__name__}", "WARNING")
+                self._rotate_proxy()
+
+            time.sleep(1.5 * (attempt + 1))
+
+        return None
+
+bypass_session = BypassSession()
+
+def get_sitemap_url() -> Optional[str]:
+    """Retrieve sitemap URL: checks env var, robots.txt, then common fallbacks."""
+    # 1. Environment variable override
+    if SITEMAP_URL:
+        log(f"Using sitemap URL from environment: {SITEMAP_URL}")
+        return SITEMAP_URL
+
+    # 2. Known domain mapping for the 4 sister sites
+    domain_clean = urlparse(CURR_URL).netloc.lower().replace("www.", "")
+    if domain_clean in SITE_SITEMAPS:
+        known_sitemap = SITE_SITEMAPS[domain_clean]
+        log(f"Using known sitemap for {domain_clean}: {known_sitemap}")
+        return known_sitemap
+
+    # 3. Try robots.txt
+    robots_url = f"{CURR_URL}/robots.txt"
+    log(f"Attempting to fetch robots.txt from {robots_url}")
+    robots_text = bypass_session.fetch(robots_url, timeout=15)
+    if robots_text:
+        for line in robots_text.splitlines():
+            line_str = line.strip()
+            if line_str.lower().startswith("sitemap:"):
+                sitemap_val = line_str.split(":", 1)[1].strip()
+                if sitemap_val.startswith("http"):
+                    log(f"Extracted Sitemap URL from robots.txt: {sitemap_val}")
+                    return sitemap_val
+
+    log("Could not extract sitemap from robots.txt (blocked or directive missing), checking common paths...", "WARNING")
+
+    # 3. Fallback common paths (including /sitemaps/sitemap_discount.xml)
+    domain_part = urlparse(CURR_URL).netloc.replace("www.", "").split(".")[0]
+    candidates = [
+        f"{CURR_URL}/sitemaps/sitemap_discount.xml",
+        f"{CURR_URL}/sitemaps/sitemap_{domain_part}.xml",
+        f"{CURR_URL}/sitemaps/sitemap_tvstands.xml",
+        f"{CURR_URL}/sitemaps/sitemap_diningrooms.xml",
+        f"{CURR_URL}/sitemaps/sitemap.xml",
+        f"{CURR_URL}/sitemaps/sitemap_dining.xml",
+        f"{CURR_URL}/sitemaps/sitemap_bedroom.xml",
+        f"{CURR_URL}/sitemap.xml",
+        f"{CURR_URL}/sitemap_index.xml",
+        f"{CURR_URL}/sitemap/sitemap.xml",
+        f"{CURR_URL}/pub/media/sitemap.xml"
+    ]
+    for candidate in candidates:
+        log(f"Probing candidate sitemap path: {candidate}", "DEBUG")
+        content = bypass_session.fetch(candidate, timeout=15)
+        if content and ("<loc>" in content or "<urlset" in content or "<sitemapindex" in content):
+            log(f"Found active sitemap candidate: {candidate}")
+            return candidate
+
     return None
+
+def http_get(url: str, is_json: bool = False) -> Optional[str]:
+    """Compatibility wrapper around bypass_session.fetch"""
+    return bypass_session.fetch(url, is_json=is_json)
+
 
 
 def _clean_strings(obj):
@@ -132,25 +590,48 @@ def _clean_strings(obj):
     return obj
 
 
-def extract_datalayer(html_text):
-    match = re.search(r'dataLayer\s*=\s*(\[[\s\S]*?\]);', html_text)
-    if not match:
-        return None
+def extract_datalayer(html_text: str) -> Optional[List[dict]]:
+    data_list = []
 
-    raw = html.unescape(match.group(1))
+    # 1. Search for dataLayer = [...]
+    for match in re.finditer(r'dataLayer\s*=\s*(\[[\s\S]*?\]);', html_text):
+        raw = html.unescape(match.group(1))
+        raw = raw.replace(':true', ':True').replace(':false', ':False').replace(':null', ':None')
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                data_list.extend(data)
+            elif isinstance(data, dict):
+                data_list.append(data)
+        except Exception:
+            try:
+                data = ast.literal_eval(raw)
+                if isinstance(data, list):
+                    data_list.extend(data)
+                elif isinstance(data, dict):
+                    data_list.append(data)
+            except Exception:
+                pass
 
-    # JS → Python literal compatibility
-    raw = raw.replace(':true', ':True') \
-             .replace(':false', ':False') \
-             .replace(':null', ':None')
+    # 2. Search for dataLayer.push(...)
+    for push_match in re.finditer(r'dataLayer\.push\s*\(\s*(\{[\s\S]*?\})\s*\);', html_text):
+        raw = html.unescape(push_match.group(1))
+        raw = raw.replace(':true', ':True').replace(':false', ':False').replace(':null', ':None')
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data_list.append(data)
+        except Exception:
+            try:
+                data = ast.literal_eval(raw)
+                if isinstance(data, dict):
+                    data_list.append(data)
+            except Exception:
+                pass
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = ast.literal_eval(raw)
-
-    # 🔥 Clean ALL strings at source
-    return _clean_strings(data)
+    if data_list:
+        return _clean_strings(data_list)
+    return None
 
 def extract_additional_product_info(html_text):
     try:
@@ -184,67 +665,200 @@ def extract_additional_product_info(html_text):
         return json.dumps({})
 
 def fetch_json(url: str) -> Optional[dict]:
-    """Fetch JSON data with proper headers"""
+    """Fetch product page HTML using bypass engine and extract dataLayer + additional product info"""
     try:
-        # Headers specifically for JSON/API requests
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, headers=headers)
-        # Look for dataLayer
-        html = response.text
-        data_layer = extract_datalayer(html)
-        additional_info = extract_additional_product_info(html)
+        html_content = bypass_session.fetch(url, is_json=False, timeout=25)
+        if not html_content:
+            log(f"No HTML content fetched for product {url}", "WARNING")
+            return None
 
-        if not data_layer:
-            print("No dataLayer found")
-            return
+        data_layer = extract_datalayer(html_content)
+        additional_info = extract_additional_product_info(html_content)
 
-        product_data = data_layer[0]
+        product_data = {}
+        if data_layer:
+            if isinstance(data_layer, list):
+                # Search through dataLayer entries to find the product info dictionary
+                for item in data_layer:
+                    if isinstance(item, dict) and any(k in item for k in ['magentoProductId', 'ecommerce', 'ecomm_prodid', 'product', 'item_id']):
+                        product_data = dict(item)
+                        break
+                if not product_data and len(data_layer) > 0 and isinstance(data_layer[0], dict):
+                    product_data = dict(data_layer[0])
+            elif isinstance(data_layer, dict):
+                product_data = dict(data_layer)
+
         product_data["additional_product_info_html"] = additional_info
-        product_data["_raw_html"] = html  # pass raw HTML for fallback parsing
+        product_data["_raw_html"] = html_content  # pass raw HTML for fallback parsing
 
         return product_data
     except Exception as e:
-        print(f"Error fetching JSON: {e}")
+        log(f"Error fetching product data for {url}: {e}", "ERROR")
         return None
 
 # ================= SITEMAP PROCESSING =================
 
-def load_xml(url: str) -> Optional[ET.Element]:
-    """Load XML with appropriate headers"""
-    # For GitHub Actions, we might need longer timeout for sitemap
+def _is_likely_sitemap_xml(text: Optional[str]) -> bool:
+    """Check if the response text contains recognizable sitemap or XML indicators."""
+    if not text or not isinstance(text, str):
+        return False
+    lower = text.lower()
+    return any(marker in lower for marker in [
+        "<loc", "&lt;loc",
+        "<sitemap", "&lt;sitemap",
+        "<urlset", "&lt;urlset",
+        "<sitemapindex", "&lt;sitemapindex",
+        "webkit-xml-viewer",
+        ".xml",
+        "<?xml", "&lt;?xml",
+        "<url", "&lt;url",
+    ])
+
+def load_xml(url: str, max_retries: int = 3) -> Optional[ET.Element]:
+    """Load XML sitemap with fast direct curl_cffi first, FlareSolverr fallback, and regex parsing"""
+    if not url or not isinstance(url, str):
+        log(f"Invalid sitemap URL passed to load_xml: {url}", "ERROR")
+        return None
+
+    candidate_urls = [url]
+    if "://www." in url:
+        candidate_urls.append(url.replace("://www.", "://"))
+    elif "://" in url:
+        candidate_urls.append(url.replace("://", "://www."))
+
     data = None
-    for attempt in range(3):
-        try:
-            # Use http_get with is_json=False for sitemap requests
-            data = http_get(url, is_json=False)
-            if data:
+    for target_url in candidate_urls:
+        for attempt in range(max_retries):
+            # Step 1: Direct curl_cffi attempt
+            if HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        target_url,
+                        headers=dict(bypass_session.browser_headers),
+                        cookies=bypass_session.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=bypass_session._get_proxies_dict(),
+                        timeout=30,
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    if resp.status_code == 200 and not bypass_session._is_challenge(resp.text) and _is_likely_sitemap_xml(resp.text):
+                        log(f"Direct curl_cffi successfully loaded XML from {target_url} ({len(resp.text):,} bytes)", "DEBUG")
+                        data = resp.text
+                        url = target_url
+                        break
+                except Exception as e:
+                    log(f"Direct curl_cffi error for {target_url}: {e}", "DEBUG")
+
+            # Step 2: Use bypass_session.fetch (invoking FlareSolverr if direct request was challenged)
+            if not data:
+                data = bypass_session.fetch(target_url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
+
+            # Step 3: If FlareSolverr obtained cf_clearance, retry raw XML download via curl_cffi
+            if (not data or not _is_likely_sitemap_xml(data)) and bypass_session.clearance_cookies.get("cf_clearance") and HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        target_url,
+                        headers=dict(bypass_session.browser_headers),
+                        cookies=bypass_session.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=bypass_session._get_proxies_dict(),
+                        timeout=30,
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    if resp.status_code == 200 and not bypass_session._is_challenge(resp.text) and _is_likely_sitemap_xml(resp.text):
+                        log(f"curl_cffi with fresh cf_clearance loaded XML from {target_url} ({len(resp.text):,} bytes)", "DEBUG")
+                        data = resp.text
+                        url = target_url
+                        break
+                except Exception:
+                    pass
+
+            if _is_likely_sitemap_xml(data):
+                url = target_url
                 break
-        except Exception as e:
-            log(f"Attempt {attempt+1} for sitemap failed: {e}", "WARNING")
-            time.sleep(2)
-    
+
+            log(f"Sitemap data from {target_url} missing XML content, retrying...", "WARNING")
+            bypass_session.flaresolverr_session_id = None
+            time.sleep(2 * (attempt + 1))
+
+        if _is_likely_sitemap_xml(data):
+            break
+
     if not data:
         log(f"Failed to load XML from {url}", "ERROR")
         return None
-        
+
+    raw_data = data
     try:
-        # Clean XML if needed
-        if "<?xml" not in data[:100]:
-            data = '<?xml version="1.0" encoding="UTF-8"?>\n' + data
-        return ET.fromstring(data)
-    except ET.ParseError as e:
-        log(f"XML parsing failed for {url}: {e}", "ERROR")
+        # Check if Chrome wrapped XML in an HTML viewer (common with FlareSolverr)
+        if '<div id="webkit-xml-viewer-source-xml"' in data:
+            match = re.search(r'<div id="webkit-xml-viewer-source-xml"[^>]*>([\s\S]*?)</div>\s*</body>', data)
+            if match:
+                data = match.group(1).strip()
+        elif '<pre' in data and '</pre>' in data:
+            match = re.search(r'<pre[^>]*>([\s\S]*?)</pre>', data)
+            if match:
+                data = match.group(1).strip()
+
+        # Unescape HTML entities if wrapped
+        if "&lt;" in data and "&gt;" in data:
+            data = html.unescape(data)
+
+        # Remove default XML namespace to make queries simple and direct
+        data_clean = re.sub(r'\sxmlns="[^"]+"', '', data, count=1)
+
+        # Trim any HTML envelope before XML root
+        start_idx = data_clean.find("<?xml")
+        if start_idx == -1:
+            start_idx = data_clean.find("<sitemapindex")
+        if start_idx == -1:
+            start_idx = data_clean.find("<urlset")
+        if start_idx != -1:
+            data_clean = data_clean[start_idx:]
+
+        # Trim any trailing content after root closing tag
+        for close_tag in ["</sitemapindex>", "</urlset>"]:
+            end_idx = data_clean.rfind(close_tag)
+            if end_idx != -1:
+                data_clean = data_clean[:end_idx + len(close_tag)]
+                break
+
+        # Clean XML declaration if needed
+        if "<?xml" not in data_clean[:100] and not data_clean.strip().startswith("<"):
+            data_clean = '<?xml version="1.0" encoding="UTF-8"?>\n' + data_clean
+
+        try:
+            import lxml.etree as letree
+            return letree.fromstring(data_clean.encode('utf-8'))
+        except Exception:
+            return ET.fromstring(data_clean)
+
+    except Exception as e:
+        log(f"XML parsing failed for {url}: {e}, attempting regex extraction", "WARNING")
         # Try to extract URLs with regex
         try:
-            # Create a dummy element
-            root = ET.Element("urlset")
-            urls = re.findall(r'<loc>(https?://[^<]+)</loc>', data)
+            clean_text = html.unescape(raw_data)
+            urls = re.findall(r'<loc[^>]*>\s*(https?://[^<\s]+)\s*</loc>', clean_text, re.IGNORECASE)
+            if not urls:
+                urls = re.findall(r'href=["\'](https?://[^"\'\s]+\.xml)["\']', clean_text, re.IGNORECASE)
+            if not urls:
+                urls = re.findall(r'https?://[^\s<"\'\\]+sitemap[^\s<"\'\\]*\.xml', clean_text, re.IGNORECASE)
+            if not urls:
+                urls = re.findall(r'https?://[^\s<"\'\\]+\.(?:xml|html)', clean_text, re.IGNORECASE)
+            if not urls:
+                log("Regex extraction found no valid URLs in sitemap data", "ERROR")
+                return None
+
+            urls = list(dict.fromkeys(u.strip() for u in urls if u and u.strip()))
+            is_index = any(".xml" in u.lower() for u in urls)
+            root = ET.Element("sitemapindex" if is_index else "urlset")
             for url_text in urls:
-                url_elem = ET.SubElement(root, "url")
-                loc_elem = ET.SubElement(url_elem, "loc")
-                loc_elem.text = url_text
+                sub_elem = ET.SubElement(root, "sitemap" if is_index else "url")
+                loc_elem = ET.SubElement(sub_elem, "loc")
+                loc_elem.text = url_text.strip()
+            log(f"Regex extraction successfully found {len(urls)} URLs in {url}")
             return root
         except Exception as e2:
             log(f"Regex extraction also failed: {e2}", "ERROR")
@@ -272,46 +886,103 @@ from typing import Dict
 
 def extract_product_data(product_data: dict) -> dict:
     """
-    Extract product data from Discount Living Rooms JSON structure
+    Extract product data from Discount Living Rooms / sister sites JSON structure + HTML fallback
     """
     try:
-        # ---------- Basic ----------
-        product_id = str(product_data.get('magentoProductId', ''))
+        if not isinstance(product_data, dict):
+            if isinstance(product_data, list) and len(product_data) > 0 and isinstance(product_data[0], dict):
+                product_data = product_data[0]
+            else:
+                product_data = {}
+
+        raw_html = product_data.get('_raw_html', '')
+
+        # ---------- Ecommerce items extraction (handles list, dict, impressions) ----------
+        ecommerce = product_data.get('ecommerce')
+        ecommerce_items = []
+        if isinstance(ecommerce, list):
+            ecommerce_items = ecommerce
+        elif isinstance(ecommerce, dict):
+            items_candidate = ecommerce.get('items') or ecommerce.get('impressions') or ecommerce.get('detail', {}).get('products')
+            if isinstance(items_candidate, list):
+                ecommerce_items = items_candidate
+            elif isinstance(items_candidate, dict):
+                ecommerce_items = [items_candidate]
+
+        # ---------- Basic: Product ID ----------
+        product_id = str(product_data.get('magentoProductId', '')).strip()
+        if not product_id and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            product_id = str(ecommerce_items[0].get('item_id', '') or ecommerce_items[0].get('id', '')).strip()
+        if not product_id and product_data.get('ecomm_prodid'):
+            ecomm_pid = product_data.get('ecomm_prodid')
+            product_id = str(ecomm_pid[0] if isinstance(ecomm_pid, list) else ecomm_pid).strip()
+        if not product_id and isinstance(product_data.get('product'), dict):
+            product_id = str(product_data['product'].get('id', '')).strip()
+
+        # ---------- Product Name ----------
         name = product_data.get('magentoProductName', '').strip()
+        if not name and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            name = str(ecommerce_items[0].get('item_name') or ecommerce_items[0].get('name') or '').strip()
+        if not name and isinstance(product_data.get('product'), dict):
+            name = str(product_data['product'].get('name', '')).strip()
+
+        # ---------- SKU ----------
         sku = product_data.get('magentoProductSku', '')
-        
-        # ---------- Brand ----------
-        # Extract brand from ecommerce items
-        ecommerce_items = product_data.get('ecommerce', {}).get('items', [])
+        if not sku and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            sku = str(ecommerce_items[0].get('item_sku') or ecommerce_items[0].get('sku') or ecommerce_items[0].get('item_id') or '')
+        if not sku:
+            sku = product_data.get('ecomm_prodsku', '')
+        if not sku and isinstance(product_data.get('product'), dict):
+            sku = str(product_data['product'].get('sku', '')).strip()
+
+        # Resolve ROOM / HOST if present in SKU
+        if 'ROOM' in sku.upper() or 'HOST' in sku.upper():
+            for ec_item in ecommerce_items:
+                if isinstance(ec_item, dict):
+                    cand = str(ec_item.get('item_sku') or ec_item.get('sku') or '').strip()
+                    if cand and 'ROOM' not in cand.upper() and 'HOST' not in cand.upper():
+                        sku = cand
+                        break
+
+        # ---------- Brand & Quantity ----------
         brand = ''
         quantity = 0
-        if ecommerce_items:
-            brand = ecommerce_items[0].get('item_brand', '')
-            quantity = ecommerce_items[0].get('quantity', '')
-        
+        if ecommerce_items and isinstance(ecommerce_items[0], dict):
+            brand = str(ecommerce_items[0].get('item_brand') or ecommerce_items[0].get('brand') or '')
+            quantity = ecommerce_items[0].get('quantity', 0)
+        if not brand and isinstance(product_data.get('product'), dict):
+            brand = str(product_data['product'].get('brand', ''))
+        if not brand:
+            brand = str(product_data.get('brand', ''))
+
         # ---------- Price ----------
-        price = product_data.get('magentoProductPrice', '')
-        
+        price = str(product_data.get('magentoProductPrice', '')).strip()
+        if not price and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            price = str(ecommerce_items[0].get('price', '')).strip()
+        if not price and isinstance(ecommerce, dict):
+            price = str(ecommerce.get('value', '')).strip()
+        if not price and product_data.get('ecomm_totalvalue'):
+            price = str(product_data.get('ecomm_totalvalue')).strip()
+
         # ---------- Main Image ----------
         main_image = product_data.get('magentoProductImage1', '')
+        if not main_image and isinstance(product_data.get('product'), dict):
+            main_image = product_data['product'].get('image', '')
+        if not main_image and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            main_image = ecommerce_items[0].get('item_image') or ecommerce_items[0].get('image') or ''
 
-        # ---------- Additional Info ----------
+        # ---------- Additional Info & MPN ----------
         additional_data = product_data.get('additional_product_info_html', '')
-        raw_html = product_data.get('_raw_html', '')
-        mpn = sku  # default fallback
+        mpn = sku
         category = ''
 
         try:
             additional_info_dict = json.loads(additional_data) if additional_data else {}
-
-            # 1️⃣ Prefer Item Number from parsed JSON
             item_number = additional_info_dict.get('item_number', '').strip()
             if item_number:
                 mpn = item_number
-
             category = additional_info_dict.get('product_type', '').strip()
 
-            # 2️⃣ Fallback: Extract directly from HTML if still empty
             if not item_number and raw_html:
                 soup = BeautifulSoup(raw_html, "html.parser")
                 for label in soup.select("div.label"):
@@ -322,16 +993,14 @@ def extract_product_data(product_data: dict) -> dict:
                             if html_item_number:
                                 mpn = html_item_number
                                 break
-
         except Exception as e:
-            print(f"Error setting mpn or category : {e}")
-        
-        
-        # ---------- Category ----------
-        category_url = ''
-        
-        if ecommerce_items and not category:
-            # Use the first available category field
+            log(f"Error setting mpn or category : {e}", "DEBUG")
+
+        if ('ROOM' in sku.upper() or 'HOST' in sku.upper()) and mpn and 'ROOM' not in mpn.upper() and 'HOST' not in mpn.upper():
+            sku = mpn
+
+        # ---------- Category from Ecommerce items ----------
+        if ecommerce_items and isinstance(ecommerce_items[0], dict) and not category:
             category_fields = [
                 'item_category', 'item_category2', 'item_category3',
                 'item_category4', 'item_category5', 'item_category6',
@@ -340,32 +1009,76 @@ def extract_product_data(product_data: dict) -> dict:
             categories = []
             for field in category_fields:
                 cat_value = ecommerce_items[0].get(field, '')
-                if cat_value:  # Only add non-empty values
-                    categories.append(cat_value)
-            
-            # Join all categories with | separator
+                if cat_value:
+                    categories.append(str(cat_value))
             if categories:
                 category = ' | '.join(categories)
-        
+
+        category_url = ''
+
+        # ---------- HTML Fallback for missing fields ----------
+        if raw_html:
+            soup = BeautifulSoup(raw_html, "html.parser")
+
+            if not product_id:
+                prod_inp = soup.find('input', {'name': 'product'})
+                if prod_inp and prod_inp.get('value'):
+                    product_id = prod_inp['value'].strip()
+                if not product_id:
+                    el = soup.find(attrs={"data-product-id": True})
+                    if el:
+                        product_id = el['data-product-id'].strip()
+                if not product_id:
+                    meta_id = soup.find('meta', {'property': 'product:retailer_item_id'}) or soup.find('meta', {'name': 'product_id'})
+                    if meta_id and meta_id.get('content'):
+                        product_id = meta_id['content'].strip()
+
+            if not name:
+                title_el = soup.find('span', {'data-ui-id': 'page-title-wrapper'}) or soup.find('h1', class_='page-title') or soup.find('h1')
+                if title_el:
+                    name = title_el.get_text(strip=True)
+                elif soup.title:
+                    name = soup.title.get_text(strip=True).split('|')[0].split('-')[0].strip()
+
+            if not sku and product_id:
+                sku = product_id
+
+            if not mpn:
+                mpn = sku
+
+            if not price:
+                price_el = soup.find('span', class_='price') or soup.find('span', {'data-price-type': 'finalPrice'}) or soup.find('meta', {'property': 'product:price:amount'})
+                if price_el:
+                    if price_el.name == 'meta':
+                        price = price_el.get('content', '').strip()
+                    else:
+                        price = re.sub(r'[^\d.]', '', price_el.get_text(strip=True))
+
+            if not main_image:
+                og_img = soup.find('meta', {'property': 'og:image'}) or soup.find('meta', {'name': 'twitter:image'})
+                if og_img and og_img.get('content'):
+                    main_image = og_img['content'].strip()
+
+            if not brand:
+                brand_meta = soup.find('meta', {'property': 'product:brand'}) or soup.find('meta', {'name': 'brand'})
+                if brand_meta and brand_meta.get('content'):
+                    brand = brand_meta['content'].strip()
+
         # ---------- Stock Status ----------
         availability = product_data.get('magentoProductAvailability', '')
         status = 'OUT_OF_STOCK'
-        
         if availability == 'InStock':
             status = 'SELLABLE'
+        elif raw_html and ('in stock' in raw_html.lower() or 'available' in raw_html.lower()):
+            status = 'SELLABLE'
 
-        
-        # ---------- Variation ID ----------
-        # Use product ID as variation ID since no separate variation field
         variation_id = ''
-        
-        # ---------- Additional Attributes ----------
         group_attr_1 = ''
         group_attr_2 = ''
-        
-        # Could use some product name parts or other fields if needed
-        # For now leaving empty as not specified in JSON
-        
+
+        if not product_id and sku:
+            product_id = sku
+
         return {
             'product_id': product_id,
             'name': name,
@@ -383,20 +1096,20 @@ def extract_product_data(product_data: dict) -> dict:
             'group_attr_2': group_attr_2,
             'additional_data': additional_data,
         }
-        
+
     except Exception as e:
-        print(f"Error extracting product data: {e}")
+        log(f"Error extracting product data: {e}", "ERROR")
         return {}
 
 def process_product_data(product_url: str, writer, seen: set, stats: dict):
-    """Process a single Overstock product URL"""
+    """Process a single product URL"""
     if product_url in seen:
         return
     seen.add(product_url)
     
     log(f"Processing product URL: {product_url}", "DEBUG")
     
-    data = fetch_json(product_url)  # This uses JSON-specific headers
+    data = fetch_json(product_url)
 
     if not data:
         stats['errors'] += 1
@@ -405,9 +1118,24 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
     
     # Extract data from response
     product_info = extract_product_data(data)
-    if not product_info.get('product_id'):
+    product_id = product_info.get('product_id')
+
+    # If product_id is still empty, derive from URL slug so valid items are not lost
+    if not product_id:
+        slug = urlparse(product_url).path.rstrip('/').split('/')[-1].replace('.html', '')
+        if slug:
+            product_id = slug
+            product_info['product_id'] = slug
+            if not product_info.get('name'):
+                product_info['name'] = slug.replace('-', ' ').title()
+            if not product_info.get('sku'):
+                product_info['sku'] = slug
+            if not product_info.get('mpn'):
+                product_info['mpn'] = slug
+
+    if not product_id:
         stats['errors'] += 1
-        log(f"Invalid data for product {product_id}", "ERROR")
+        log(f"Invalid data for product {product_url}", "ERROR")
         return
     
     try:
@@ -435,8 +1163,10 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
         
         with csv_lock:
             writer.writerow(row)
+            stats['products_fetched'] += 1
+            if uploader:
+                uploader.on_item_scraped(stats['products_fetched'], file_handle=csv_file_handle)
         
-        stats['products_fetched'] += 1
         log(f"Fetched product {product_info['product_id']}: {product_info['name'][:50]}...", "INFO")
         
     except Exception as e:
@@ -447,139 +1177,308 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
     time.sleep(REQUEST_DELAY)
     stats['urls_processed'] += 1
 
-# ================= MAIN =================
+def collect_all_sitemap_urls(sitemap: Optional[str] = None, output_file: Optional[str] = None) -> List[str]:
+    """
+    Check all sitemaps, extract product counts per sitemap, log a breakdown,
+    and persist the complete list of unique product URLs to output_file.
+    """
+    if not sitemap:
+        sitemap = get_sitemap_url()
 
-def main():
-    sitemap = get_sitemap_from_robots_txt()
     log("=" * 60)
-    log("Overstock Parallel Scraper")
-    log(f"Timestamp: {SCRAPED_DATE}")
+    log(f"DLR / {COMPETITOR_NAME} SITEMAP PRODUCT DISCOVERY & INVENTORY")
     log(f"Base URL: {CURR_URL}")
-    log(f"API Base URL: {API_BASE_URL}")
     log(f"Sitemap Index: {sitemap}")
-    log(f"Sitemap Offset: {SITEMAP_OFFSET}")
-    log(f"Max Sitemaps: {MAX_SITEMAPS if MAX_SITEMAPS > 0 else 'All'}")
-    log(f"Max URLs per Sitemap: {MAX_URLS_PER_SITEMAP if MAX_URLS_PER_SITEMAP > 0 else 'All'}")
-    log(f"Max Workers: {MAX_WORKERS}")
-    log(f"Request Delay: {REQUEST_DELAY}s")
+    log(f"FlareSolverr: {FLARESOLVERR_URL or 'None'}")
     log("=" * 60)
-    
-    # Load sitemap index - NO HEADERS for sitemap
-    log(f"Loading sitemap index from {sitemap}")
+
+    if not sitemap:
+        log(f"ERROR: Could not locate a valid sitemap for {CURR_URL}.", "ERROR")
+        sys.exit(1)
+
     index = load_xml(sitemap)
     if index is None:
         log("Failed to load sitemap index", "ERROR")
         sys.exit(1)
-    
-    # Extract sitemap URLs
+
     ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemaps = []
-    
-    # Try different XML structures
+    child_sitemaps = []
+
     for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
         elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
         if elements:
-            sitemaps = [e.text.strip() for e in elements 
-            if e.text and "product" in e.text.lower()]
-            break
-    
-    # If still no sitemaps, try regex
-    if not sitemaps:
-        log("No sitemaps found with XML parsing, trying regex", "WARNING")
-    
-    # Apply offset and limit
-    if SITEMAP_OFFSET >= len(sitemaps):
-        log(f"Offset {SITEMAP_OFFSET} exceeds total sitemaps ({len(sitemaps)})", "WARNING")
+            child_sitemaps = [e.text.strip() for e in elements if e.text and "product" in e.text.lower()]
+            if child_sitemaps:
+                break
+
+    if not child_sitemaps:
+        url_elements = index.findall(".//ns:url/ns:loc", ns) if index.find(".//ns:url", ns) is not None else index.findall(".//url/loc")
+        if url_elements:
+            child_sitemaps = [sitemap]
+        else:
+            all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
+            child_sitemaps = all_locs if all_locs else [sitemap]
+
+    child_sitemaps = list(dict.fromkeys(child_sitemaps))
+    log(f"Discovered {len(child_sitemaps)} child sitemaps in index.")
+
+    sitemap_counts: Dict[str, int] = {}
+    all_urls: List[str] = []
+    lock = threading.Lock()
+
+    def process_child_sitemap(sm_url: str):
+        xml = load_xml(sm_url)
+        if not xml:
+            log(f"Failed to load child sitemap: {sm_url}", "WARNING")
+            with lock:
+                sitemap_counts[sm_url] = 0
+            return
+
+        urls = []
+        for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+            elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+            if elements:
+                urls = [
+                    e.text.strip()
+                    for e in elements
+                    if e.text
+                    and not any(ext in e.text.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.css', '.js'])
+                    and '.html' in e.text.lower()
+                ]
+                if urls:
+                    break
+
+        with lock:
+            sitemap_counts[sm_url] = len(urls)
+            all_urls.extend(urls)
+
+    fetch_workers = min(10, max(2, len(child_sitemaps)))
+    log(f"Checking {len(child_sitemaps)} child sitemaps with {fetch_workers} workers...")
+    with ThreadPoolExecutor(max_workers=fetch_workers) as executor:
+        futures = [executor.submit(process_child_sitemap, sm) for sm in child_sitemaps]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as ex:
+                log(f"Error processing child sitemap: {ex}", "ERROR")
+
+    unique_urls = list(dict.fromkeys(all_urls))
+
+    log("=" * 60)
+    log(f"{COMPETITOR_NAME} SITEMAP INVENTORY & PRODUCT COUNT SUMMARY")
+    log("=" * 60)
+    for idx, sm_url in enumerate(child_sitemaps, start=1):
+        count = sitemap_counts.get(sm_url, 0)
+        log(f"[{idx:02d}/{len(child_sitemaps):02d}] {sm_url} -> {count:,} product URLs")
+    log("-" * 60)
+    log(f"Total Sitemaps Checked: {len(child_sitemaps)}")
+    log(f"Total Discovered URLs: {len(all_urls):,}")
+    log(f"Total Unique Product URLs: {len(unique_urls):,}")
+    log("=" * 60)
+
+    target_file = output_file or MASTER_URLS_FILE
+    with open(target_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(unique_urls))
+    log(f"Saved {len(unique_urls):,} unique product URLs to {target_file}")
+
+    return unique_urls
+
+# ================= MAIN =================
+
+def main():
+    sitemap = get_sitemap_url()
+
+    if COLLECT_URLS_ONLY or "--collect-urls" in sys.argv:
+        collect_all_sitemap_urls(sitemap=sitemap, output_file=MASTER_URLS_FILE)
         sys.exit(0)
-    
-    end_index = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemaps)
-    sitemaps_to_process = sitemaps[SITEMAP_OFFSET:end_index]
-    
-    log(f"Total sitemaps found: {len(sitemaps)}")
-    log(f"Sitemaps to process: {len(sitemaps_to_process)}")
-    
-    # Initialize CSV
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        
-        # Write header
-        writer.writerow([
-            "Ref Product URL",
-            "Ref Product ID",
-            "Ref Varient ID",
-            "Ref Category",
-            "Ref Category URL",
-            "Ref Brand Name",
-            "Ref Product Name",
-            "Ref SKU",
-            "Ref MPN",
-            "Ref GTIN",
-            "Ref Price",
-            "Ref Main Image",
-            "Ref Quantity",
-            "Ref Group Attr 1",
-            "Ref Group Attr 2",
-            "Ref Status",
-            "Additional Product Data",
-            "Date Scrapped"
-        ])
-        
-        # Initialize tracking
-        seen = set()
-        all_product_urls: list = []  # track all sitemap URLs across all sitemaps
-        stats = {
-            'sitemaps_processed': 0,
-            'urls_processed': 0,
-            'products_fetched': 0,
-            'errors': 0
-        }
-        
-        # Process each sitemap
-        for sitemap_url in sitemaps_to_process:
-            stats['sitemaps_processed'] += 1
-            log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
-            
-            # Load product sitemap - NO HEADERS for sitemap
+
+    log("=" * 60)
+    log("Overstock / DRL Parallel Scraper")
+    log(f"Timestamp: {SCRAPED_DATE}")
+    log(f"Base URL: {CURR_URL}")
+    log(f"API Base URL: {API_BASE_URL}")
+    log(f"Site Name: {SITE_NAME}")
+    log(f"Chunk Index: {CHUNK_INDEX}")
+    log(f"Total Chunks: {TOTAL_CHUNKS if TOTAL_CHUNKS > 0 else 'N/A'}")
+    log(f"URLs File: {URLS_FILE if URLS_FILE else 'None (Sitemap-driven)'}")
+    log(f"Max Workers: {MAX_WORKERS}")
+    log(f"Request Delay: {REQUEST_DELAY}s")
+    log(f"curl_cffi Available: {HAS_CURL_CFFI}")
+    log(f"cloudscraper Available: {HAS_CLOUDSCRAPER}")
+    log(f"FlareSolverr Configured: {FLARESOLVERR_URL or 'No'}")
+    log(f"Proxy Configured: {'Yes' if PROXY_ENV else 'No (auto-detection)'}")
+    log("=" * 60)
+
+    urls_to_process = []
+
+    # Mode 1: Pre-partitioned URL list (evenly balanced across runners)
+    if URLS_FILE and os.path.exists(URLS_FILE):
+        log(f"Loading pre-partitioned URLs from {URLS_FILE}")
+        with open(URLS_FILE, "r", encoding="utf-8") as uf:
+            urls_to_process = [line.strip() for line in uf if line.strip() and line.strip().startswith("http")]
+        log(f"Product URLs assigned to this chunk from {URLS_FILE}: {len(urls_to_process):,}")
+
+    # Mode 2: Legacy Sitemap-offset processing (fallback)
+    else:
+        if not sitemap:
+            log("=" * 60, "ERROR")
+            log(f"ERROR: Could not locate a valid sitemap for {CURR_URL}.", "ERROR")
+            log("The website may be protected by Cloudflare bot challenge/captcha.", "ERROR")
+            log("=" * 60, "ERROR")
+            sys.exit(1)
+
+        log(f"Loading sitemap index from {sitemap}")
+        index = load_xml(sitemap)
+        if index is None:
+            log("Failed to load sitemap index", "ERROR")
+            sys.exit(1)
+
+        ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        sitemaps = []
+
+        for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
+            elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
+            if elements:
+                sitemaps = [e.text.strip() for e in elements if e.text and "product" in e.text.lower()]
+                if sitemaps:
+                    break
+
+        if not sitemaps:
+            url_elements = index.findall(".//ns:url/ns:loc", ns) if index.find(".//ns:url", ns) is not None else index.findall(".//url/loc")
+            if url_elements:
+                sitemaps = [sitemap]
+            else:
+                all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
+                sitemaps = all_locs if all_locs else [sitemap]
+
+        discovered_urls = []
+        for sitemap_url in sitemaps:
+            log(f"Loading sitemap URLs from: {sitemap_url}")
             xml = load_xml(sitemap_url)
             if not xml:
-                log(f"Failed to load sitemap: {sitemap_url}", "ERROR")
                 continue
-            
-            # Extract product URLs - Overstock product URLs typically contain /product/ or /catalog/
-            urls = []
             for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
                 elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
                 if elements:
-                    urls = [
+                    sm_urls = [
                         e.text.strip()
                         for e in elements
                         if e.text
-                        and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
-                        and (
-                            '.html' in e.text
-                        )
+                        and not any(ext in e.text.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.css', '.js'])
+                        and '.html' in e.text.lower()
                     ]
-                    if urls:
-                        all_product_urls.extend(urls)  # track sitemap URLs
+                    if sm_urls:
+                        discovered_urls.extend(sm_urls)
                         break
+
+        discovered_urls = list(dict.fromkeys(discovered_urls))
+        total_discovered = len(discovered_urls)
+        log(f"Total unique product URLs discovered across sitemaps: {total_discovered}")
+
+        if total_discovered == 0:
+            log("No product URLs found in any sitemap. Exiting.", "WARNING")
+            sys.exit(0)
+
+        if TOTAL_CHUNKS > 0:
+            chunk_size = (total_discovered + TOTAL_CHUNKS - 1) // TOTAL_CHUNKS
+            start_idx = CHUNK_INDEX * chunk_size
+            end_idx = min(start_idx + chunk_size, total_discovered)
+            if start_idx >= total_discovered:
+                log(f"Chunk {CHUNK_INDEX} out of range for {total_discovered} URLs. Exiting.", "WARNING")
+                sys.exit(0)
+            urls_to_process = discovered_urls[start_idx:end_idx]
+            log(f"URL Chunking Active: Chunk {CHUNK_INDEX + 1}/{TOTAL_CHUNKS} -> processing {len(urls_to_process)} URLs ({start_idx} to {end_idx} of {total_discovered})")
+        else:
+            if SITEMAP_OFFSET >= len(sitemaps):
+                log(f"Offset {SITEMAP_OFFSET} exceeds total sitemaps ({len(sitemaps)})", "WARNING")
+                sys.exit(0)
+            end_index = SITEMAP_OFFSET + MAX_SITEMAPS if MAX_SITEMAPS > 0 else len(sitemaps)
+            sitemaps_to_process = sitemaps[SITEMAP_OFFSET:end_index]
+            for sm_url in sitemaps_to_process:
+                xml = load_xml(sm_url)
+                if not xml:
+                    continue
+                for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                    elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                    if elements:
+                        sm_urls = [e.text.strip() for e in elements if e.text and '.html' in e.text.lower()]
+                        if sm_urls:
+                            urls_to_process.extend(sm_urls)
+                            break
+            urls_to_process = list(dict.fromkeys(urls_to_process))
+
+    if MAX_URLS_PER_SITEMAP > 0:
+        original_count = len(urls_to_process)
+        urls_to_process = urls_to_process[:MAX_URLS_PER_SITEMAP]
+        log(f"Limited to {len(urls_to_process)} out of {original_count} URLs")
+    else:
+        log(f"Product URLs assigned to this chunk: {len(urls_to_process)}")
+
+    global csv_file_handle, uploader
+
+    # Initialize periodic FTP streaming
+    uploader = PeriodicFTPUploader(
+        local_csv=OUTPUT_CSV,
+        remote_csv=REMOTE_TEMP_CSV,
+        local_urls=URL_LIST_FILE,
+        remote_urls=REMOTE_TEMP_URLS,
+        sync_items=FTP_SYNC_ITEMS
+    )
+
+    stats = {
+        'sitemaps_processed': len(sitemaps),
+        'urls_processed': 0,
+        'products_fetched': 0,
+        'errors': 0
+    }
+    all_product_urls: list = list(urls_to_process)
+
+    # Immediately persist assigned URLs and trigger initial sync
+    try:
+        with open(URL_LIST_FILE, "w", encoding="utf-8") as _uf:
+            _uf.write("\n".join(all_product_urls))
+        if uploader:
+            uploader.trigger_sync()
+    except Exception as _uex:
+        log(f"[URL-LIST] Early write note: {_uex}", "DEBUG")
+
+    try:
+        # Initialize CSV
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+            csv_file_handle = f
+            writer = csv.writer(f)
             
-            if not urls:
-                log(f"No product URLs found in sitemap: {sitemap_url}", "WARNING")
-                continue
+            # Write header
+            writer.writerow([
+                "Ref Product URL",
+                "Ref Product ID",
+                "Ref Varient ID",
+                "Ref Category",
+                "Ref Category URL",
+                "Ref Brand Name",
+                "Ref Product Name",
+                "Ref SKU",
+                "Ref MPN",
+                "Ref GTIN",
+                "Ref Price",
+                "Ref Main Image",
+                "Ref Quantity",
+                "Ref Group Attr 1",
+                "Ref Group Attr 2",
+                "Ref Status",
+                "Additional Product Data",
+                "Date Scrapped"
+            ])
+            f.flush()
             
-            # Apply URL limit
-            if MAX_URLS_PER_SITEMAP > 0:
-                original_count = len(urls)
-                urls = urls[:MAX_URLS_PER_SITEMAP]
-                log(f"Limited to {len(urls)} out of {original_count} URLs")
-            else:
-                log(f"Found {len(urls)} product URLs in this sitemap")
+            # Initialize tracking
+            seen = set()
             
             # Process URLs in parallel
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = [
                     executor.submit(process_product_data, url, writer, seen, stats)
-                    for url in urls
+                    for url in urls_to_process
                 ]
                 for future in as_completed(futures):
                     try:
@@ -590,7 +1489,12 @@ def main():
             
             # Clean up memory
             gc.collect()
-    
+    finally:
+        # Guarantee that whatever data was scraped is pushed to FTP before exiting
+        if uploader:
+            uploader.shutdown(current_count=stats['products_fetched'], file_handle=csv_file_handle)
+        csv_file_handle = None
+
     # Print statistics
     log("=" * 60)
     log("SCRAPING STATISTICS")
@@ -606,21 +1510,16 @@ def main():
     log(f"Completed: {OUTPUT_CSV}")
     log("=" * 60)
 
-
-# Save per-chunk URL list for artifact upload (merged in YML merge job)
-if __name__ == "__main__" and 'all_product_urls' in dir() and all_product_urls:
-    try:
-        _chunk_id = locals().get('CHUNK_ID') or locals().get('SITEMAP_OFFSET', '0')
-        _url_list_file = f"url_list_chunk_{_chunk_id}.txt"
-        with open(_url_list_file, "w", encoding="utf-8") as _uf:
-            _uf.write("\n".join(all_product_urls))
-        print(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {_url_list_file}", flush=True)
-    except Exception as _exc:
-        print(f"[URL-LIST] Warning: {_exc}", flush=True)
+    # Save final per-chunk URL list for artifact upload
+    if all_product_urls:
+        try:
+            with open(URL_LIST_FILE, "w", encoding="utf-8") as _uf:
+                _uf.write("\n".join(all_product_urls))
+            log(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {URL_LIST_FILE}")
+        except Exception as _exc:
+            log(f"[URL-LIST] Warning: {_exc}", "WARNING")
 
 if __name__ == "__main__":
-    # Suppress SSL warnings
-    import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     # Validate environment variables
@@ -629,4 +1528,3 @@ if __name__ == "__main__":
         sys.exit(1)
     
     main()
-    log(f"Note: URL tracking post-processing error: {exc}")

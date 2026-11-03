@@ -24,6 +24,7 @@ import os
 import sys
 import csv
 import json
+import time
 import logging
 import argparse
 import ftplib
@@ -338,22 +339,45 @@ class FTPManager:
                 pass
             self.ftp = None
 
-    def _makedirs(self, remote_dir: str):
-        """Recursively creates remote FTP directory path if missing."""
+    def _makedirs(self, remote_dir: str) -> str:
+        """Recursively creates remote FTP directory path if missing, with case-insensitive matching."""
         if not remote_dir or remote_dir == "/":
-            return
+            return "/"
         parts = [p for p in remote_dir.replace("\\", "/").split("/") if p]
         curr = ""
         for p in parts:
-            curr += "/" + p
+            next_target = f"{curr}/{p}"
             try:
-                self.ftp.cwd(curr)
+                self.ftp.cwd(next_target)
+                curr = next_target
+                continue
             except Exception:
+                pass
+
+            # Try case-insensitive matching against existing directories in current folder
+            matched = False
+            try:
+                entries = self.ftp.nlst()
+                for entry in entries:
+                    entry_clean = os.path.basename(entry.rstrip("/"))
+                    if entry_clean.lower() == p.lower():
+                        case_target = f"{curr}/{entry_clean}"
+                        self.ftp.cwd(case_target)
+                        curr = case_target
+                        matched = True
+                        break
+            except Exception:
+                pass
+
+            if not matched:
                 try:
-                    self.ftp.mkd(curr)
-                    self.ftp.cwd(curr)
+                    self.ftp.mkd(next_target)
+                    self.ftp.cwd(next_target)
+                    curr = next_target
                 except Exception as e:
-                    logger.warning(f"Note creating FTP directory {curr}: {e}")
+                    logger.warning(f"Note creating FTP directory {next_target}: {e}")
+                    # If mkd fails, keep curr as-is and attempt to proceed
+        return curr
 
     def upload_competitor_tree(self, local_base_dir: str, competitor: str, date_str: Optional[str] = None):
         """Uploads the local competitor directory tree matching {Competitor}/{YYYYMMDD}/... to FTP."""
@@ -377,7 +401,7 @@ class FTPManager:
                 remote_path = f"{self.base_dir}/{rel_path}".replace("\\", "/").replace("//", "/")
                 remote_dir = os.path.dirname(remote_path)
 
-                self._makedirs(remote_dir)
+                actual_dir = self._makedirs(remote_dir)
                 logger.info(f"Uploading '{file}' -> FTP '{remote_path}'...")
                 with open(local_path, "rb") as f:
                     self.ftp.storbinary(f"STOR {file}", f)
@@ -385,6 +409,41 @@ class FTPManager:
 
         logger.info(f"✓ Uploaded {uploaded} files to FTP for {pm.competitor}/{pm.date_str}.")
         return uploaded
+
+    def upload_file(self, local_path: str, remote_file_path: str, max_retries: int = 3) -> bool:
+        """Uploads a single local file directly to remote_file_path on the FTP server."""
+        if not os.path.exists(local_path):
+            logger.warning(f"Local file does not exist for upload: {local_path}")
+            return False
+
+        remote_clean = remote_file_path.replace("\\", "/").strip("/")
+        remote_dir = os.path.dirname(remote_clean)
+        remote_filename = os.path.basename(remote_clean)
+
+        for attempt in range(max_retries):
+            try:
+                if not self.ftp:
+                    self.connect()
+                if remote_dir:
+                    actual_dir = self._makedirs(remote_dir)
+                    if actual_dir:
+                        try:
+                            self.ftp.cwd(actual_dir)
+                        except Exception as e_cwd:
+                            logger.warning(f"Could not cwd to {actual_dir}: {e_cwd}")
+
+                with open(local_path, "rb") as f:
+                    self.ftp.storbinary(f"STOR {remote_filename}", f)
+                logger.info(f"✓ Uploaded '{remote_filename}' -> FTP '/{remote_dir}/{remote_filename}'")
+                return True
+            except Exception as e:
+                logger.warning(f"FTP upload attempt {attempt+1} failed for {remote_filename}: {e}")
+                self.disconnect()
+                if attempt + 1 < max_retries:
+                    time.sleep(2 * (attempt + 1))
+
+        logger.error(f"Failed to upload {local_path} to FTP after {max_retries} attempts.")
+        return False
 
 
 def main():
@@ -408,6 +467,11 @@ def main():
     upload_parser.add_argument("-c", "--competitor", required=True, help="Competitor name (e.g. Coleman)")
     upload_parser.add_argument("-b", "--base-dir", default="output", help="Local base output directory containing structure")
     upload_parser.add_argument("-d", "--date", default="", help="Date string YYYYMMDD")
+
+    # Command: upload-file
+    upload_file_parser = subparsers.add_parser("upload-file", help="Upload a single local file directly to a remote FTP path")
+    upload_file_parser.add_argument("-l", "--local-file", required=True, help="Local file path")
+    upload_file_parser.add_argument("-r", "--remote-file", required=True, help="Remote FTP file path")
 
     args = parser.parse_args()
 
@@ -435,6 +499,25 @@ def main():
         try:
             ftp_mgr.connect()
             ftp_mgr.upload_competitor_tree(args.base_dir, args.competitor, args.date)
+        finally:
+            ftp_mgr.disconnect()
+
+    elif args.command == "upload-file":
+        host = os.getenv("FTP_HOST", "")
+        user = os.getenv("FTP_USER", "")
+        pass_ = os.getenv("FTP_PASS", "")
+        port = int(os.getenv("FTP_PORT", "21"))
+        base_dir = os.getenv("FTP_PATH", os.getenv("FTP_BASE_DIR", ""))
+
+        if not host or not user or not pass_:
+            logger.error("Missing FTP_HOST, FTP_USER, or FTP_PASS environment variables.")
+            sys.exit(1)
+
+        ftp_mgr = FTPManager(host, user, pass_, port, base_dir)
+        try:
+            ftp_mgr.connect()
+            success = ftp_mgr.upload_file(args.local_file, args.remote_file)
+            sys.exit(0 if success else 1)
         finally:
             ftp_mgr.disconnect()
     else:

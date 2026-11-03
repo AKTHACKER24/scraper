@@ -1036,7 +1036,16 @@ class Validate:
         for v in variants:
             if not v:
                 continue
-            if v in url_raw or v in url_norm:
+            # Ensure boundary check so ASL-92101S1 does not match ASL-92101S10
+            pat_raw = r'(?<![a-z0-9])' + re.escape(v) + r'(?![a-z0-9])'
+            matched = bool(re.search(pat_raw, url_raw))
+            if not matched and v in url_norm:
+                pat_norm = r'(?<![a-z0-9])' + re.escape(v) + r'(?![a-z0-9])'
+                matched = bool(re.search(pat_norm, url_norm))
+            if matched:
+                # Avoid matching ROOM/HOST whole set against single product
+                if ('room' in v or 'host' in v) != ('room' in url_raw or 'host' in url_raw):
+                    continue
                 score += self.get_score_config('exact_mpn_match')
                 row['mpn_exist'] = 1
                 reasons.append('Exact SKU MATCH')
@@ -1055,10 +1064,12 @@ class Validate:
             if not p:
                 all_match = False
                 break
-            p_norm = self.normalize(p)
-            if p not in url_raw and (not p_norm or p_norm not in url_norm):
-                all_match = False
-                break
+            pat = r'(?<![a-z0-9])' + re.escape(p) + r'(?![a-z0-9])'
+            if not re.search(pat, url_raw):
+                p_norm = self.normalize(p)
+                if not p_norm or not re.search(r'(?<![a-z0-9])' + re.escape(p_norm) + r'(?![a-z0-9])', url_norm):
+                    all_match = False
+                    break
         if all_match:
             score += self.get_score_config('exact_mpn_match')
             row['mpn_exist'] = 1
