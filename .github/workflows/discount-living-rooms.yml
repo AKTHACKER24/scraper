@@ -61,7 +61,7 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.generate_matrix.outputs.matrix }}
+      matrix: ${{ steps.build_matrix.outputs.matrix }}
 
     # Service container for Cloudflare bypass during sitemap discovery
     services:
@@ -390,13 +390,22 @@ jobs:
 
           with open("url_chunks/manifest.json", "w", encoding="utf-8") as mf:
               json.dump(manifest, mf, indent=2)
-
-          matrix_items = [{"chunk_id": item["chunk_id"]} for item in manifest]
-          matrix_json = json.dumps({"include": matrix_items})
           print(f"Total planned jobs across all sites: {len(manifest)}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"matrix={matrix_json}\n")
           EOF
+
+      - name: Build clean runner matrix
+        id: build_matrix
+        run: |
+          python3 -c "
+          import json, os
+          with open('url_chunks/manifest.json') as f:
+              manifest = json.load(f)
+          matrix_items = [{'chunk_id': item['chunk_id']} for item in manifest]
+          matrix_json = json.dumps({'include': matrix_items})
+          print(f'Total planned jobs across all sites: {len(matrix_items)}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fo:
+              fo.write(f'matrix={matrix_json}\n')
+          "
 
       - name: Upload URL chunks artifact
         uses: actions/upload-artifact@v4
@@ -423,7 +432,7 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 20
-      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.plan.outputs.matrix || '{"include":[]}') }}
 
     services:
       flaresolverr:
