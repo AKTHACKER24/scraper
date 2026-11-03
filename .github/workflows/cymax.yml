@@ -16,7 +16,7 @@ on:
         default: "50000"
       total_chunks:
         description: "Number of parallel chunks to split into (0 = auto by urls_per_job)"
-        default: "0"
+        default: "220"
       max_workers:
         description: "Parallel requests per job"
         default: "6"
@@ -219,7 +219,6 @@ jobs:
     # timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 20
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
