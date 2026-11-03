@@ -35,7 +35,10 @@ class unlimitedFurnitureScraper:
         self.curr_url             = os.getenv("CURR_URL", "https://www.unlimitedfurnituregroup.com").rstrip("/")
         self.api_base_url         = os.getenv("API_BASE_URL", "").rstrip("/")
         self.sitemap_url          = os.getenv("SITEMAP_URL", "").strip()
+        self.urls_file            = os.getenv("URLS_FILE", "").strip()
+        self.flaresolverr_url     = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
         self.sitemap_offset       = int(os.getenv("SITEMAP_OFFSET", "0"))
+        self.chunk_id             = os.getenv("CHUNK_ID", str(self.sitemap_offset))
         self.max_sitemaps         = int(os.getenv("MAX_SITEMAPS", "0"))
         self.max_urls_per_sitemap = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
         self.max_workers          = int(os.getenv("MAX_WORKERS", "4"))
@@ -43,8 +46,8 @@ class unlimitedFurnitureScraper:
 
         self.output_dir   = "media/output/scrapping/unlimitedfurniture"
         self.failure_dir  = "media/output/scrapping/failure_csv"
-        self.output_csv   = f"unlimitedfurniture_products_chunk_{self.sitemap_offset}.csv"
-        self.skipped_plp_csv = f"unlimitedfurniture_skipped_plp_{self.sitemap_offset}.csv"
+        self.output_csv   = f"unlimitedfurniture_products_chunk_{self.chunk_id}.csv"
+        self.skipped_plp_csv = f"unlimitedfurniture_skipped_plp_{self.chunk_id}.csv"
         self.scraped_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         self.csv_header = [
@@ -99,6 +102,25 @@ class unlimitedFurnitureScraper:
     #  HTTP
     # ============================================================
 
+    def _fetch_flaresolverr(self, url: str) -> Optional[str]:
+        if not self.flaresolverr_url:
+            return None
+        try:
+            endpoint = f"{self.flaresolverr_url}/v1" if not self.flaresolverr_url.endswith("/v1") else self.flaresolverr_url
+            payload = {"cmd": "request.get", "url": url, "maxTimeout": 60000}
+            resp = self.session.post(endpoint, json=payload, timeout=70)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "ok":
+                    solution = data.get("solution", {})
+                    html = solution.get("response", "")
+                    if html:
+                        self.log(f"FlareSolverr resolved {url}", "DEBUG")
+                        return html
+        except Exception as e:
+            self.log(f"FlareSolverr error for {url}: {e}", "DEBUG")
+        return None
+
     def http_get(self, url: str, is_json: bool = False) -> Optional[str]:
         """GET with up to 3 retries. Supports curl_cffi impersonation or standard requests."""
         for attempt in range(3):
@@ -119,10 +141,21 @@ class unlimitedFurnitureScraper:
                 r = self.session.get(url, **kwargs)
 
                 if r.status_code == 200:
-                    self.log(f"Success: {url}", "DEBUG")
-                    return r.text
+                    if "<title>Just a moment...</title>" in r.text or "cf-turnstile" in r.text or "challenge-running" in r.text:
+                        self.log(f"Cloudflare challenge detected on 200 for {url}", "WARNING")
+                        fs_res = self._fetch_flaresolverr(url)
+                        if fs_res:
+                            return fs_res
+                    else:
+                        self.log(f"Success: {url}", "DEBUG")
+                        return r.text
 
                 self.log(f"Status {r.status_code} for {url}", "WARNING")
+                if r.status_code in (403, 503) and self.flaresolverr_url:
+                    fs_res = self._fetch_flaresolverr(url)
+                    if fs_res:
+                        return fs_res
+
                 if r.status_code == 429:
                     time.sleep(5)
 
@@ -218,7 +251,8 @@ class unlimitedFurnitureScraper:
         for idx_url in index_urls:
             children = self.get_child_sitemaps(idx_url)
             for c in children:
-                if c not in child_sitemaps:
+                c_fname = c.split("/")[-1]
+                if not any(existing.split("/")[-1] == c_fname for existing in child_sitemaps):
                     child_sitemaps.append(c)
 
         self.log(f"Total discovered child sitemaps: {len(child_sitemaps)}", "INFO")
@@ -545,7 +579,10 @@ class unlimitedFurnitureScraper:
         self.log("unlimitedfurniture Parallel Bulk Scraper")
         self.log(f"Timestamp:            {self.scraped_date}")
         self.log(f"curl_cffi Available:  {HAS_CURL_CFFI}")
+        self.log(f"FlareSolverr URL:     {self.flaresolverr_url or 'None'}")
         self.log(f"Base URL:             {self.curr_url}")
+        self.log(f"URLs File:            {self.urls_file or 'None (Sitemap-driven)'}")
+        self.log(f"Chunk ID:             {self.chunk_id}")
         self.log(f"Sitemap Offset:       {self.sitemap_offset}")
         self.log(f"Max Sitemaps:         {self.max_sitemaps or 'All'}")
         self.log(f"Max URLs per Sitemap: {self.max_urls_per_sitemap or 'All'}")
@@ -553,6 +590,48 @@ class unlimitedFurnitureScraper:
         self.log(f"Request Delay:        {self.request_delay}s")
         self.log("=" * 60)
 
+        os.makedirs(self.output_dir, exist_ok=True)
+        output_path = os.path.join(self.output_dir, self.output_csv)
+
+        # Mode A: Direct URLs file (Resume Mode / Partitioned chunks)
+        if self.urls_file and os.path.isfile(self.urls_file):
+            self.log(f"Loading URLs directly from file: {self.urls_file}")
+            with open(self.urls_file, "r", encoding="utf-8") as f:
+                raw_urls = [line.strip() for line in f if line.strip() and line.strip().startswith("http")]
+
+            candidate_products = []
+            for u in raw_urls:
+                if self._is_plp_url(u):
+                    self.stats["plp_urls_skipped"] += 1
+                    self.log_skipped_plp(u)
+                else:
+                    candidate_products.append(u)
+
+            self.log(f"Loaded {len(candidate_products)} candidate product URLs to scrape ({self.stats['plp_urls_skipped']} PLPs skipped)")
+            with open(output_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.csv_header)
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = [
+                        executor.submit(self.process_product, url, writer)
+                        for url in candidate_products
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            self.log(f"Thread error: {e}", "ERROR")
+                            self.stats["errors"] += 1
+
+            self.log("=" * 60)
+            self.log("SCRAPING COMPLETE (FILE MODE)")
+            self.log(f"  Products fetched:    {self.stats['products_fetched']}")
+            self.log(f"  PLP skipped:         {self.stats['plp_urls_skipped']}")
+            self.log(f"  Errors:              {self.stats['errors']}")
+            self.log("=" * 60)
+            return
+
+        # Mode B: Sitemap-driven scraping
         all_sitemaps = self.get_all_sitemaps()
 
         if not all_sitemaps:
