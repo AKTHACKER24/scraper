@@ -322,9 +322,18 @@ jobs:
 
           matrix_json = json.dumps(matrix_items)
           print(f"Total planned jobs across all sites: {len(matrix_items)}")
+          with open("matrix.json", "w", encoding="utf-8") as f:
+              f.write(matrix_json)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={matrix_json}\n")
           EOF
+
+      - name: Upload matrix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlr_matrix
+          path: matrix.json
+          retention-days: 1
 
       - name: Upload URL chunks artifact
         uses: actions/upload-artifact@v4
@@ -342,16 +351,32 @@ jobs:
           retention-days: 2
           if-no-files-found: warn
 
-  scrape:
+  prepare_matrix:
     needs: plan
-    if: needs.plan.result == 'success' && needs.plan.outputs.matrix != '' && needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Download matrix artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dlr_matrix
+      - name: Set matrix output
+        id: set-matrix
+        run: |
+          MATRIX_CONTENT=$(cat matrix.json)
+          echo "matrix=${MATRIX_CONTENT}" >> $GITHUB_OUTPUT
+
+  scrape:
+    needs: [plan, prepare_matrix]
+    if: needs.plan.result == 'success' && needs.prepare_matrix.outputs.matrix != '' && needs.prepare_matrix.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     name: "Scrape (${{ matrix.site_key }} - chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }} [${{ matrix.url_count }} URLs])"
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix || '[]') }}
+        include: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }}
 
     services:
       flaresolverr:
