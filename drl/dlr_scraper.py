@@ -1310,6 +1310,7 @@ def main():
     log("=" * 60)
 
     urls_to_process = []
+    sitemaps = []
 
     # Mode 1: Pre-partitioned URL list (evenly balanced across runners)
     if URLS_FILE and os.path.exists(URLS_FILE):

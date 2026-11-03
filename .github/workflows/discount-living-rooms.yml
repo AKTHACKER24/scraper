@@ -477,15 +477,16 @@ jobs:
       - name: Process each site (Merge CSV, Track URLs, Prepare FTP)
         id: process_sites
         run: |
+          mkdir -p chunks master_urls ftp_output
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
           FILE_DATE=$(date +%F_%H%M%S)
 
           echo "Listing all downloaded chunk files:"
-          find chunks -type f | sort
+          find chunks -type f | sort || true
 
           # Detect all site keys present in chunks
-          SITE_KEYS=$(find chunks -name "products_*_chunk_*.csv" | sed -E 's|.*/products_([^_]+)_chunk_.*|\1|' | sort -u)
+          SITE_KEYS=$(find chunks -name "products_*_chunk_*.csv" 2>/dev/null | sed -E 's|.*/products_([^_]+)_chunk_.*|\1|' | sort -u)
           if [ -z "$SITE_KEYS" ]; then
             SITE_KEYS="discountlivingrooms"
           fi
