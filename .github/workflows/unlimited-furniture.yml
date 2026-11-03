@@ -45,7 +45,7 @@ jobs:
           TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
           PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
         run: |
-          python3 - << 'EOF'
+          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
           import os
           import json
           import urllib.request
@@ -120,7 +120,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+        include: ${{ fromJson(needs.plan.outputs.matrix || '[]') }}
 
     steps:
       - name: Checkout repository

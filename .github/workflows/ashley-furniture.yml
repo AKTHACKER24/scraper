@@ -1,5 +1,9 @@
 name: Ashley Furniture - Parallel Product Scraper
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -309,6 +313,14 @@ jobs:
       - name: Create output directory
         run: mkdir -p output
           
+      - name: Download merged URLs artifact
+        if: ${{ github.event.inputs.scrape_only != 'true' || github.event.inputs.urls_file == '' }}
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ashley_urls_complete
+          path: url_chunks
+
       - name: Determine URLs file
         id: urls_file
         run: |
@@ -316,13 +328,13 @@ jobs:
             # Use provided URLs file
             echo "file=${{ github.event.inputs.urls_file }}" >> $GITHUB_OUTPUT
           else
-            # Download merged URLs artifact
-            echo "Downloading merged URLs..."
-            if [ -d "url_chunks" ]; then
-              rm -rf url_chunks
+            # Download merged URLs artifact fallback if not present
+            COMPLETE_FILE=$(find url_chunks -name "*.json" -type f 2>/dev/null | head -n 1)
+            if [ -z "$COMPLETE_FILE" ]; then
+              echo "Attempting gh run download fallback..."
+              gh run download ${{ github.run_id }} -n ashley_urls_complete -D url_chunks || true
+              COMPLETE_FILE=$(find url_chunks -name "*.json" -type f 2>/dev/null | head -n 1)
             fi
-            gh run download ${{ github.run_id }} -n ashley_urls_complete -D url_chunks
-            COMPLETE_FILE=$(find url_chunks -name "*.json" -type f | head -n 1)
             echo "file=$COMPLETE_FILE" >> $GITHUB_OUTPUT
           fi
         env:
