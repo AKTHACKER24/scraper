@@ -36,9 +36,9 @@ MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10000"))
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
 FLARESOLVERR_URLS_ENV = os.getenv("FLARESOLVERR_URLS", "")
 FLARESOLVERR_INSTANCES = int(os.getenv("FLARESOLVERR_INSTANCES", "0"))
-FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "60"))
+FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "90"))
 FLARESOLVERR_MAX_RETRIES = int(os.getenv("FLARESOLVERR_MAX_RETRIES", "5"))
-FLARESOLVERR_REQUEST_TIMEOUT_MS = int(os.getenv("FLARESOLVERR_REQUEST_TIMEOUT_MS", "90000"))
+FLARESOLVERR_REQUEST_TIMEOUT_MS = int(os.getenv("FLARESOLVERR_REQUEST_TIMEOUT_MS", "60000"))
 
 # ---------- NEW: chunked single‑sitemap mode ----------
 SITEMAP_URL = os.getenv("SITEMAP_URL", "")          # process exactly this sitemap
@@ -141,9 +141,7 @@ class FlareSolverrSession:
                 payload = {
                     "cmd": "request.get",
                     "url": url,
-                    "maxTimeout": FLARESOLVERR_REQUEST_TIMEOUT_MS,
-                    "session": None,  # Create new session
-                    "headers": self.headers
+                    "maxTimeout": FLARESOLVERR_REQUEST_TIMEOUT_MS
                 }
                 
                 response = self.session.post(
@@ -168,17 +166,16 @@ class FlareSolverrSession:
                                 domain=cookie.get("domain")
                             )
                         
-                        # Update headers from response
-                        if "headers" in solution:
-                            for key, value in solution["headers"].items():
-                                if key.lower() not in ["content-length", "content-encoding", "transfer-encoding"]:
-                                    self.headers[key] = value
-                        
                         return content, 200
                 
                 if response.status_code >= 500:
                     self._rotate_to_next_endpoint()
-                log(f"FlareSolverr attempt {attempt + 1} failed for {url}: {response.status_code}")
+                err_detail = ""
+                try:
+                    err_detail = f" - {response.text[:200]}"
+                except Exception:
+                    pass
+                log(f"FlareSolverr attempt {attempt + 1} failed for {url}: {response.status_code}{err_detail}")
                 
             except requests.exceptions.Timeout:
                 self._rotate_to_next_endpoint()
@@ -265,6 +262,10 @@ def check_robots_txt():
                 if len(parts) > 1:
                     potential_url = sanitize_url_text(parts[1].strip())
                     if potential_url.startswith('http'):
+                        curr_parsed = urlparse(CURR_URL)
+                        sitemap_parsed = urlparse(potential_url)
+                        if curr_parsed.netloc.startswith("www.") and not sitemap_parsed.netloc.startswith("www."):
+                            potential_url = potential_url.replace(f"://{sitemap_parsed.netloc}", f"://{curr_parsed.netloc}")
                         sitemap_url = potential_url
                         log(f"Found valid sitemap in robots.txt: {sitemap_url}")
             elif line.lower().startswith('crawl-delay:'):
