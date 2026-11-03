@@ -68,10 +68,10 @@ permissions:
 env:
   WEBSITE_URL:      "https://colemanfurniture.com"
   SOURCE_TYPE:      ${{ github.event.inputs.source_type }}
-  FTP_HOST:         ${{ secrets.FTP_HOST || 'ftp-sandbox.1sb.pp.ua' }}
+  FTP_HOST:         ${{ secrets.FTP_HOST }}
   FTP_PORT:         ${{ secrets.FTP_PORT || '21' }}
-  FTP_USER:         ${{ secrets.FTP_USER || 'onestop_ftp-sandbox' }}
-  FTP_PASS:         ${{ secrets.FTP_PASS || 'OneStop123' }}
+  FTP_USER:         ${{ secrets.FTP_USER }}
+  FTP_PASS:         ${{ secrets.FTP_PASS }}
   FTP_PATH:         ${{ secrets.FTP_PATH || '/scrap/' }}
   FTP_FILENAME:     ${{ github.event.inputs.ftp_filename }}
   BASE_API:         ${{ github.event.inputs.base_api }}

@@ -235,11 +235,11 @@ def main():
                         help="Input source type for URL collection (ftp, sitemap, api, direct)")
     
     # FTP args
-    parser.add_argument("--ftp-host", default="ftp-sandbox.1sb.pp.ua", help="FTP Hostname")
-    parser.add_argument("--ftp-port", type=int, default=21, help="FTP Port")
-    parser.add_argument("--ftp-user", default="onestop_ftp-sandbox", help="FTP Username")
-    parser.add_argument("--ftp-pass", default="OneStop123", help="FTP Password")
-    parser.add_argument("--ftp-path", default="/scrap/", help="FTP directory path")
+    parser.add_argument("--ftp-host", default=os.getenv("FTP_HOST", ""), help="FTP Hostname")
+    parser.add_argument("--ftp-port", type=int, default=int(os.getenv("FTP_PORT", "21") or "21"), help="FTP Port")
+    parser.add_argument("--ftp-user", default=os.getenv("FTP_USER", ""), help="FTP Username")
+    parser.add_argument("--ftp-pass", default=os.getenv("FTP_PASS", ""), help="FTP Password")
+    parser.add_argument("--ftp-path", default=os.getenv("FTP_PATH", "/scrap/"), help="FTP directory path")
     parser.add_argument("--ftp-filename", default="", help="Specific CSV filename on FTP server")
     
     # Sitemap args
