@@ -147,17 +147,17 @@ jobs:
           echo "Pages: $START_PAGE - $END_PAGE"
           
           # Run URL collection script
-          OUTPUT=$(python colemanfurniture_brand_file_scraper/scripts/run_ashley_scraper.py \
+          python colemanfurniture_brand_file_scraper/scripts/run_ashley_scraper.py \
             --manufacturer-id "$MANUFACTURER_ID" \
             --start-page "$START_PAGE" \
             --end-page "$END_PAGE" \
             --chunk "$CHUNK" \
             --url-concurrency "$URL_CONCURRENCY" \
             --job-id "chunk_$CHUNK" \
-            --output-dir output)
+            --output-dir output
           
           # Extract output file path
-          OUTPUT_FILE=$(echo "$OUTPUT" | grep "OUTPUT_FILE=" | cut -d'=' -f2)
+          OUTPUT_FILE=$(find output -name "ashley_urls_chunk_${CHUNK}_*.json" -type f | head -n 1)
           echo "OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
           
       - name: List output files
@@ -450,6 +450,7 @@ jobs:
 
       - name: Download all product artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           path: product_chunks
           
@@ -523,11 +524,13 @@ jobs:
           COMP_DIR="output/Ashley/$DATE"
           mkdir -p "$COMP_DIR/input" "$COMP_DIR/output/temp" "$COMP_DIR/output"
           
-          if [ -f "urls_merged.csv" ] || [ -f "url_chunks/ashley_urls.json" ]; then
-            URL_FILE="urls_merged.csv"
-            [ ! -f "$URL_FILE" ] && URL_FILE="url_chunks/ashley_urls.json"
-            cp "$URL_FILE" "$COMP_DIR/input/URLList${TS}.csv" 2>/dev/null || true
-            cp "$URL_FILE" "$COMP_DIR/output/temp/URLListForScrap${TS}.csv" 2>/dev/null || true
+          URL_FILE=$(find output -name "ashley_urls_complete_*.json" 2>/dev/null | head -n 1)
+          if [ -z "$URL_FILE" ]; then
+            URL_FILE=$(find url_chunks -name "*.json" 2>/dev/null | head -n 1)
+          fi
+          if [ -n "$URL_FILE" ]; then
+            cp "$URL_FILE" "$COMP_DIR/input/URLList${TS}.json" 2>/dev/null || true
+            cp "$URL_FILE" "$COMP_DIR/output/temp/URLListForScrap${TS}.json" 2>/dev/null || true
           fi
           
           if [ -f "ashley_products_full.csv" ]; then
@@ -535,9 +538,9 @@ jobs:
             cp ashley_products_full.csv "$COMP_DIR/output/FinalScrappedData${TS}.csv"
           fi
           
-          if [ -f "urls_merged.csv" ] && [ -f "ashley_products_full.csv" ]; then
+          if [ -n "$URL_FILE" ] && [ -f "ashley_products_full.csv" ]; then
             python3 ftp_manager.py track-urls \
-              -s "urls_merged.csv" \
+              -s "$URL_FILE" \
               -d "ashley_products_full.csv" \
               -o "$COMP_DIR/output/FinalURLListForScrap${TS}.csv" || true
           fi
