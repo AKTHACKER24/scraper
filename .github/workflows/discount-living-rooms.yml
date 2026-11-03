@@ -22,6 +22,11 @@ on:
         description: "Custom sitemap URL override (optional, single site only)"
         required: false
         default: ""
+      use_ftp_urls:
+        description: "Use pre-collected URL lists from FTP (/scrap/urls/) instead of crawling sitemaps"
+        type: boolean
+        required: false
+        default: true
       urls_per_runner:
         description: "Max product URLs to scrape per parallel runner"
         default: "1500"
@@ -48,10 +53,10 @@ on:
         default: "0"
 
 env:
-  FTP_HOST: ${{ secrets.FTP_HOST || 'ftp-sandbox.1sb.pp.ua' }}
+  FTP_HOST: ${{ secrets.FTP_HOST }}
   FTP_PORT: ${{ secrets.FTP_PORT || '21' }}
-  FTP_USER: ${{ secrets.FTP_USER || 'onestop_ftp-sandbox' }}
-  FTP_PASS: ${{ secrets.FTP_PASS || 'OneStop123' }}
+  FTP_USER: ${{ secrets.FTP_USER }}
+  FTP_PASS: ${{ secrets.FTP_PASS }}
   FTP_PATH: ${{ secrets.FTP_PATH || '/scrap/' }}
 
 jobs:
@@ -107,11 +112,17 @@ jobs:
           TARGET_SITE: ${{ github.event.inputs.target_site }}
           CUSTOM_URL: ${{ github.event.inputs.custom_url }}
           CUSTOM_SITEMAP: ${{ github.event.inputs.sitemap_url }}
+          USE_FTP_URLS: ${{ github.event.inputs.use_ftp_urls != 'false' }}
           URLS_PER_RUNNER: ${{ github.event.inputs.urls_per_runner }}
           TOTAL_RUNNERS_PER_SITE: ${{ github.event.inputs.total_runners_per_site }}
           MAX_TOTAL_URLS: ${{ github.event.inputs.max_total_urls }}
           FLARESOLVERR_URL: "http://localhost:8191/v1"
           PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_PATH: ${{ env.FTP_PATH }}
         run: |
           python3 - << 'EOF'
           import os
@@ -119,14 +130,21 @@ jobs:
           import json
           import math
           import subprocess
+          import ftplib
           from urllib.parse import urlparse
 
           target = os.environ.get("TARGET_SITE", "ALL")
           custom_url = os.environ.get("CUSTOM_URL", "").strip()
           custom_sitemap = os.environ.get("CUSTOM_SITEMAP", "").strip()
+          use_ftp_urls = os.environ.get("USE_FTP_URLS", "true").lower() in ("true", "1", "yes")
           urls_per_runner = int(os.environ.get("URLS_PER_RUNNER", "1500") or "1500")
           total_runners_input = int(os.environ.get("TOTAL_RUNNERS_PER_SITE", "0") or "0")
           max_total_urls = int(os.environ.get("MAX_TOTAL_URLS", "0") or "0")
+          ftp_host = os.environ.get("FTP_HOST", "").strip()
+          ftp_user = os.environ.get("FTP_USER", "").strip()
+          ftp_pass = os.environ.get("FTP_PASS", "").strip()
+          ftp_port = int(os.environ.get("FTP_PORT", "21") or "21")
+          ftp_path = os.environ.get("FTP_PATH", "/scrap").rstrip("/")
 
           all_sites = [
               {
@@ -185,23 +203,49 @@ jobs:
               site_url = s["url"]
               site_sitemap = custom_sitemap if (custom_sitemap and len(selected) == 1) else s["sitemap_url"]
               site_master_file = f"all_urls_{site_key}.txt"
+              urls_loaded_from_ftp = False
 
-              print(f"\n============================================================")
-              print(f" Checking all sitemaps for site: {site_key} ({competitor})")
-              print(f" Base URL: {site_url}")
-              print(f" Sitemap: {site_sitemap}")
-              print(f"============================================================")
+              if use_ftp_urls:
+                  if not (ftp_host and ftp_user and ftp_pass):
+                      print("⚠ FTP secrets (FTP_HOST, FTP_USER, FTP_PASS) are not configured. Falling back to sitemap discovery.")
+                  else:
+                      remote_url_file = f"{ftp_path}/urls/all_urls_{site_key}.txt"
+                      print(f"\n============================================================")
+                      print(f" Checking FTP for pre-collected URLs: {remote_url_file}")
+                      print(f" Site: {site_key} ({competitor})")
+                      print(f"============================================================")
+                      try:
+                          ftp = ftplib.FTP()
+                          ftp.connect(ftp_host, ftp_port, timeout=30)
+                          ftp.login(ftp_user, ftp_pass)
+                          with open(site_master_file, "wb") as f_out:
+                              ftp.retrbinary(f"RETR {remote_url_file}", f_out.write)
+                          ftp.quit()
+                          if os.path.exists(site_master_file) and os.path.getsize(site_master_file) > 0:
+                              print(f"✓ Successfully fetched pre-collected URLs from FTP ({os.path.getsize(site_master_file):,} bytes)")
+                              urls_loaded_from_ftp = True
+                          else:
+                              print("⚠ Downloaded file was empty, falling back to sitemap discovery.")
+                      except Exception as ex_ftp:
+                          print(f"⚠ Could not download URLs from FTP ({ex_ftp}), falling back to sitemap discovery.")
 
-              env_copy = os.environ.copy()
-              env_copy["CURR_URL"] = site_url
-              env_copy["SITE_NAME"] = site_key
-              env_copy["SITEMAP_URL"] = site_sitemap
-              env_copy["MASTER_URLS_FILE"] = site_master_file
-              env_copy["COLLECT_URLS_ONLY"] = "1"
+              if not urls_loaded_from_ftp:
+                  print(f"\n============================================================")
+                  print(f" Checking all sitemaps for site: {site_key} ({competitor})")
+                  print(f" Base URL: {site_url}")
+                  print(f" Sitemap: {site_sitemap}")
+                  print(f"============================================================")
 
-              res = subprocess.run([sys.executable, "drl/dlr_scraper.py"], env=env_copy)
-              if res.returncode != 0:
-                  print(f"⚠ Warning: URL collection for {site_key} returned code {res.returncode}")
+                  env_copy = os.environ.copy()
+                  env_copy["CURR_URL"] = site_url
+                  env_copy["SITE_NAME"] = site_key
+                  env_copy["SITEMAP_URL"] = site_sitemap
+                  env_copy["MASTER_URLS_FILE"] = site_master_file
+                  env_copy["COLLECT_URLS_ONLY"] = "1"
+
+                  res = subprocess.run([sys.executable, "drl/dlr_scraper.py"], env=env_copy)
+                  if res.returncode != 0:
+                      print(f"⚠ Warning: URL collection for {site_key} returned code {res.returncode}")
 
               if not os.path.exists(site_master_file):
                   print(f"⚠ No URL file generated for {site_key}, creating empty file.")

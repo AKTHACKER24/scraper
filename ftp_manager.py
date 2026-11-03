@@ -445,6 +445,41 @@ class FTPManager:
         logger.error(f"Failed to upload {local_path} to FTP after {max_retries} attempts.")
         return False
 
+    def download_file(self, remote_file_path: str, local_path: str, max_retries: int = 3) -> bool:
+        """Downloads a single file from remote_file_path on the FTP server to local_path."""
+        remote_clean = remote_file_path.replace("\\", "/").strip("/")
+        remote_dir = os.path.dirname(remote_clean)
+        remote_filename = os.path.basename(remote_clean)
+        os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+
+        for attempt in range(max_retries):
+            try:
+                if not self.ftp:
+                    self.connect()
+                if remote_dir:
+                    try:
+                        self.ftp.cwd(f"/{remote_dir}")
+                    except Exception:
+                        self.ftp.cwd(remote_dir)
+
+                with open(local_path, "wb") as f:
+                    self.ftp.retrbinary(f"RETR {remote_filename}", f.write)
+                logger.info(f"✓ Downloaded '{remote_filename}' from FTP '/{remote_dir}/{remote_filename}' -> '{local_path}'")
+                return True
+            except Exception as e:
+                logger.warning(f"FTP download attempt {attempt+1} failed for {remote_filename}: {e}")
+                self.disconnect()
+                if os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        pass
+                if attempt + 1 < max_retries:
+                    time.sleep(2 * (attempt + 1))
+
+        logger.error(f"Failed to download {remote_file_path} from FTP after {max_retries} attempts.")
+        return False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Centralized FTP Storage & Sitemap URL Tracking CLI")
@@ -472,6 +507,11 @@ def main():
     upload_file_parser = subparsers.add_parser("upload-file", help="Upload a single local file directly to a remote FTP path")
     upload_file_parser.add_argument("-l", "--local-file", required=True, help="Local file path")
     upload_file_parser.add_argument("-r", "--remote-file", required=True, help="Remote FTP file path")
+
+    # Command: download-file
+    download_file_parser = subparsers.add_parser("download-file", help="Download a single file from remote FTP path to local path")
+    download_file_parser.add_argument("-r", "--remote-file", required=True, help="Remote FTP file path")
+    download_file_parser.add_argument("-l", "--local-file", required=True, help="Local file path")
 
     args = parser.parse_args()
 
@@ -517,6 +557,25 @@ def main():
         try:
             ftp_mgr.connect()
             success = ftp_mgr.upload_file(args.local_file, args.remote_file)
+            sys.exit(0 if success else 1)
+        finally:
+            ftp_mgr.disconnect()
+
+    elif args.command == "download-file":
+        host = os.getenv("FTP_HOST", "")
+        user = os.getenv("FTP_USER", "")
+        pass_ = os.getenv("FTP_PASS", "")
+        port = int(os.getenv("FTP_PORT", "21"))
+        base_dir = os.getenv("FTP_PATH", os.getenv("FTP_BASE_DIR", ""))
+
+        if not host or not user or not pass_:
+            logger.error("Missing FTP_HOST, FTP_USER, or FTP_PASS environment variables.")
+            sys.exit(1)
+
+        ftp_mgr = FTPManager(host, user, pass_, port, base_dir)
+        try:
+            ftp_mgr.connect()
+            success = ftp_mgr.download_file(args.remote_file, args.local_file)
             sys.exit(0 if success else 1)
         finally:
             ftp_mgr.disconnect()

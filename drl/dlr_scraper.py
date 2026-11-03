@@ -27,6 +27,12 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+try:
     from ftp_manager import FTPManager, normalize_competitor_name
     HAS_FTP_MANAGER = True
 except Exception:
@@ -1286,6 +1292,7 @@ def collect_all_sitemap_urls(sitemap: Optional[str] = None, output_file: Optiona
 # ================= MAIN =================
 
 def main():
+    global URLS_FILE
     sitemap = get_sitemap_url()
 
     if COLLECT_URLS_ONLY or "--collect-urls" in sys.argv:
@@ -1311,6 +1318,33 @@ def main():
 
     urls_to_process = []
     sitemaps = []
+
+    use_ftp = os.getenv("USE_FTP_URLS", "").strip().lower() in ("1", "true", "yes") or "--use-ftp-urls" in sys.argv
+    if not URLS_FILE and use_ftp:
+        target_local_urls = f"all_urls_{SITE_NAME}.txt"
+        if not os.path.exists(target_local_urls) or os.path.getsize(target_local_urls) == 0:
+            if not (FTP_HOST and FTP_USER and FTP_PASS):
+                log("FTP credentials (FTP_HOST, FTP_USER, FTP_PASS) are not set in environment; skipping FTP download.", "WARNING")
+            else:
+                remote_ftp_urls = f"{FTP_PATH.rstrip('/')}/urls/all_urls_{SITE_NAME}.txt"
+                log(f"Attempting to download pre-collected URLs from FTP: {remote_ftp_urls}...")
+                try:
+                    import ftplib
+                    ftp_port = FTP_PORT or 21
+                    ftp_client = ftplib.FTP()
+                    ftp_client.connect(FTP_HOST, ftp_port, timeout=30)
+                    ftp_client.login(FTP_USER, FTP_PASS)
+                    with open(target_local_urls, "wb") as _f_ftp:
+                        ftp_client.retrbinary(f"RETR {remote_ftp_urls}", _f_ftp.write)
+                    ftp_client.quit()
+                    if os.path.exists(target_local_urls) and os.path.getsize(target_local_urls) > 0:
+                        log(f"✓ Fetched {os.path.getsize(target_local_urls):,} bytes from FTP for {SITE_NAME}")
+                        URLS_FILE = target_local_urls
+                except Exception as _fe:
+                    log(f"⚠ Could not fetch URLs from FTP ({_fe})", "WARNING")
+        else:
+            log(f"Using already cached {target_local_urls}")
+            URLS_FILE = target_local_urls
 
     # Mode 1: Pre-partitioned URL list (evenly balanced across runners)
     if URLS_FILE and os.path.exists(URLS_FILE):
