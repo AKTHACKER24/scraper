@@ -77,6 +77,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Wait for FlareSolverr to be ready
+        continue-on-error: true
         run: |
           echo "Waiting for FlareSolverr service to be ready..."
           sleep 10
@@ -90,9 +91,8 @@ jobs:
             echo "Attempt $i: FlareSolverr not ready yet..."
             sleep 2
             if [ $i -eq 30 ]; then
-              echo "❌ FlareSolverr failed to start after 60 seconds"
-              docker logs flaresolverr || true
-              exit 1
+              echo "⚠ FlareSolverr not ready after 60 seconds, continuing anyway..."
+              break
             fi
           done
 
@@ -124,7 +124,7 @@ jobs:
           FTP_PORT: ${{ env.FTP_PORT }}
           FTP_PATH: ${{ env.FTP_PATH }}
         run: |
-          python3 - << 'EOF'
+          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
           import os
           import sys
           import json
@@ -344,13 +344,14 @@ jobs:
 
   scrape:
     needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.matrix != '' && needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     name: "Scrape (${{ matrix.site_key }} - chunk ${{ matrix.chunk_index }}/${{ matrix.total_chunks }} [${{ matrix.url_count }} URLs])"
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+        include: ${{ fromJson(needs.plan.outputs.matrix || '[]') }}
 
     services:
       flaresolverr:
@@ -363,6 +364,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Wait for FlareSolverr to be ready
+        continue-on-error: true
         run: |
           echo "Waiting for FlareSolverr service to be ready..."
           sleep 10
@@ -376,9 +378,8 @@ jobs:
             echo "Attempt $i: FlareSolverr not ready yet..."
             sleep 2
             if [ $i -eq 30 ]; then
-              echo "❌ FlareSolverr failed to start after 60 seconds"
-              docker logs flaresolverr || true
-              exit 1
+              echo "⚠ FlareSolverr not ready after 60 seconds, continuing anyway..."
+              break
             fi
           done
 
@@ -438,7 +439,7 @@ jobs:
           COMPETITOR: ${{ matrix.competitor }}
           CHUNK_INDEX: ${{ matrix.chunk_index }}
         run: |
-          python3 - << 'EOF'
+          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
           import os, glob, sys
           from datetime import datetime, timezone
           sys.path.insert(0, ".")

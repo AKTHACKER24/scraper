@@ -125,7 +125,7 @@ jobs:
           MAX_TOTAL_URLS: ${{ github.event.inputs.max_total_urls }}
           CURR_URL: ${{ github.event.inputs.url }}
         run: |
-          python3 - << 'EOF'
+          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
           import os
           import json
           import math
@@ -311,7 +311,7 @@ jobs:
           FTP_PATH: ${{ env.FTP_PATH }}
           CHUNK_INDEX: ${{ matrix.chunk_index }}
         run: |
-          python3 - << 'EOF'
+          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
           import os, glob, sys
           from datetime import datetime, timezone
           sys.path.insert(0, ".")
