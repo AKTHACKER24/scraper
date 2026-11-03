@@ -136,6 +136,9 @@ jobs:
           COLLECT_URLS_ONLY: "1"
           MASTER_URLS_FILE: cymax_all_urls.txt
           CURR_URL: ${{ github.event.inputs.url }}
+          FLARESOLVERR_INSTANCES: ${{ steps.flaresolverr_pool.outputs.instances }}
+          FLARESOLVERR_URL: ${{ steps.flaresolverr_pool.outputs.first_url }}
+          FLARESOLVERR_URLS: ${{ steps.flaresolverr_pool.outputs.urls }}
         run: |
           python cymax/cymax.py
           if [ ! -f cymax_all_urls.txt ]; then
@@ -167,6 +170,12 @@ jobs:
               URLS_PER_JOB=50000
             fi
             CHUNK_COUNT=$(( (TOTAL_URLS + URLS_PER_JOB - 1) / URLS_PER_JOB ))
+          fi
+
+          # Ensure matrix doesn't exceed GitHub Actions 256 job limit
+          if [ "$CHUNK_COUNT" -gt 250 ]; then
+            CHUNK_COUNT=250
+            URLS_PER_JOB=$(( (TOTAL_URLS + CHUNK_COUNT - 1) / CHUNK_COUNT ))
           fi
 
           echo "Total URLs: $TOTAL_URLS"
