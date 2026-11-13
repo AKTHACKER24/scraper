@@ -30,10 +30,19 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        return "Unlimited Furniture", 18096
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        return "Unlimited Furniture"
 
 
 class unlimitedFurnitureScraper:
@@ -482,7 +491,8 @@ class unlimitedFurnitureScraper:
             writer.writerow(row)
         if HAS_DB_QUEUE:
             try:
-                save_scraped_product("Unlimited Furniture", 18096, {
+                comp_name, cid = get_competitor_from_url(row[0], default_name="Unlimited Furniture", default_id=18096)
+                save_scraped_product(comp_name, cid, {
                     "url": row[0], "product_id": row[1], "category": row[2],
                     "category_url": row[3], "brand": row[4], "name": row[5],
                     "sku": row[6], "mpn": row[7], "gtin": row[8],

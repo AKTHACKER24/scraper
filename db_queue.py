@@ -44,6 +44,27 @@ COMPETITOR_ID_MAP = {
     "grayson living": 20013,
 }
 
+DOMAIN_TO_COMPETITOR = {
+    "discountlivingrooms.com": ("Discount Living Rooms", 15311),
+    "bedroomfurniturediscounts.com": ("Bedroom Furniture Discounts", 20604),
+    "diningroomsoutlet.com": ("Dining Rooms Outlet", 19434),
+    "tvstandsoutlet.com": ("TV Stands Outlet", 22109),
+    "cymax.com": ("Cymax", 20612),
+    "homesquare.com": ("Homesquare", 17442),
+    "overstock.com": ("Overstock", 16167),
+    "bedbathandbeyond.com": ("Bed Bath & Beyond", 19034),
+    "bisonoffice.com": ("BisonOffice.com", 17927),
+    "colemanfurniture.com": ("Coleman Furniture", 17028),
+    "homegallerystores.com": ("Home Gallery Stores", 15177),
+    "unlimitedfurnituregroup.com": ("Unlimited Furniture", 18096),
+    "unlimitedfurniture.com": ("Unlimited Furniture", 18096),
+    "emmamason.com": ("Emma Mason", 16060),
+    "franceandson.com": ("France & Son", 16169),
+    "englishelm.com": ("English Elm", 20492),
+    "afastores.com": ("AFA Stores", 19894),
+    "graysonliving.com": ("Grayson Living", 20013),
+}
+
 def resolve_competitor_id(competitor_name, competitor_id=None):
     if competitor_id is not None and competitor_id > 0:
         return competitor_id
@@ -54,6 +75,64 @@ def resolve_competitor_id(competitor_name, competitor_id=None):
         if k in name_clean or name_clean in k:
             return v
     return None
+
+def get_competitor_from_url(url: str, default_name: str = None, default_id: int = None):
+    """
+    Extracts canonical competitor name and competitor_id strictly based on the URL domain.
+    """
+    if url:
+        url_lower = str(url).lower()
+        for domain, (c_name, c_id) in DOMAIN_TO_COMPETITOR.items():
+            if domain in url_lower:
+                return c_name, c_id
+        
+        # Substring / keyword fallbacks
+        if "homesquare" in url_lower:
+            return "Homesquare", 17442
+        elif "cymax" in url_lower:
+            return "Cymax", 20612
+        elif "discountliving" in url_lower:
+            return "Discount Living Rooms", 15311
+        elif "bedroomfurniture" in url_lower:
+            return "Bedroom Furniture Discounts", 20604
+        elif "diningrooms" in url_lower:
+            return "Dining Rooms Outlet", 19434
+        elif "tvstands" in url_lower:
+            return "TV Stands Outlet", 22109
+        elif "bedbath" in url_lower:
+            return "Bed Bath & Beyond", 19034
+        elif "overstock" in url_lower:
+            return "Overstock", 16167
+        elif "bisonoffice" in url_lower:
+            return "BisonOffice.com", 17927
+        elif "colemanfurniture" in url_lower:
+            return "Coleman Furniture", 17028
+        elif "homegallery" in url_lower:
+            return "Home Gallery Stores", 15177
+        elif "unlimitedfurniture" in url_lower:
+            return "Unlimited Furniture", 18096
+        elif "emmamason" in url_lower:
+            return "Emma Mason", 16060
+        elif "franceandson" in url_lower:
+            return "France & Son", 16169
+        elif "englishelm" in url_lower:
+            return "English Elm", 20492
+        elif "afastores" in url_lower:
+            return "AFA Stores", 19894
+        elif "graysonliving" in url_lower:
+            return "Grayson Living", 20013
+
+    if default_name:
+        cid = resolve_competitor_id(default_name, default_id)
+        return default_name, cid
+    return "Unknown", default_id
+
+def get_competitor_name_from_url(url: str, default: str = None) -> str:
+    name, _ = get_competitor_from_url(url, default_name=default)
+    return name
+
+def filter_urls_by_competitor(urls: list, mode: str = None, default_name: str = None, default_id: int = None) -> list:
+    return filter_pending_urls(default_name, urls, competitor_id=default_id, mode=mode)
 
 def get_connection():
     for attempt in range(5):
@@ -111,9 +190,10 @@ def clean_date(v):
 
 def filter_pending_urls(competitor_name, urls, competitor_id=None, mode=None):
     """
-    Given a list of URLs for a competitor:
-    1. Registers all new incoming URLs into `competitor_urls` as 'pending'.
-    2. Depending on `mode` ('remaining' vs 'full'):
+    Given a list of URLs:
+    1. Determines each URL's canonical competitor dynamically from the URL domain.
+    2. Registers all new incoming URLs into `competitor_urls` as 'pending' under their canonical competitor.
+    3. Depending on `mode` ('remaining' vs 'full'):
        - 'remaining' (default): returns ONLY URLs that have NOT yet been marked 'scraped' in DB.
        - 'full': returns ALL URLs (for full re-scraping).
     """
@@ -125,8 +205,6 @@ def filter_pending_urls(competitor_name, urls, competitor_id=None, mode=None):
     else:
         mode = str(mode).lower()
 
-    cid = resolve_competitor_id(competitor_name, competitor_id)
-
     conn = None
     try:
         conn = get_connection()
@@ -136,7 +214,10 @@ def filter_pending_urls(competitor_name, urls, competitor_id=None, mode=None):
             batch_size = 1000
             for i in range(0, len(urls), batch_size):
                 chunk = urls[i:i + batch_size]
-                values = [(competitor_name, cid, u, "pending") for u in chunk]
+                values = []
+                for u in chunk:
+                    c_name, c_id = get_competitor_from_url(u, default_name=competitor_name, default_id=competitor_id)
+                    values.append((c_name, c_id, u, "pending"))
                 insert_sql = """
                 INSERT IGNORE INTO competitor_urls (competitor_name, competitor_id, url, status)
                 VALUES (%s, %s, %s, %s)
@@ -145,18 +226,27 @@ def filter_pending_urls(competitor_name, urls, competitor_id=None, mode=None):
 
             # 2. If 'full' scraping requested, return all URLs
             if mode in ("full", "all", "force_all"):
-                print(f"[{competitor_name}] Scrape Mode: FULL. Total URLs to scrape: {len(urls):,}")
+                print(f"[{competitor_name or 'All'}] Scrape Mode: FULL. Total URLs to scrape: {len(urls):,}")
                 return urls
 
             # 3. If 'remaining' mode (default), fetch URLs already marked 'scraped'
-            cur.execute("""
-                SELECT url FROM competitor_urls 
-                WHERE competitor_name = %s AND status = 'scraped'
-            """, (competitor_name,))
-            scraped_set = set(row[0] for row in cur.fetchall())
+            competitors_in_chunk = set()
+            for u in urls:
+                c_name, _ = get_competitor_from_url(u, default_name=competitor_name, default_id=competitor_id)
+                competitors_in_chunk.add(c_name)
+
+            scraped_set = set()
+            for c_name in competitors_in_chunk:
+                cur.execute("""
+                    SELECT url FROM competitor_urls 
+                    WHERE competitor_name = %s AND status = 'scraped'
+                """, (c_name,))
+                for row in cur.fetchall():
+                    scraped_set.add(row[0])
 
             pending_urls = [u for u in urls if u not in scraped_set]
-            print(f"[{competitor_name}] Scrape Mode: REMAINING. Total: {len(urls):,} | Already Scraped: {len(scraped_set):,} | Pending: {len(pending_urls):,}")
+            comp_display = ", ".join(sorted(competitors_in_chunk)) if competitors_in_chunk else (competitor_name or "All")
+            print(f"[{comp_display}] Scrape Mode: REMAINING. Total: {len(urls):,} | Already Scraped: {len(urls) - len(pending_urls):,} | Pending: {len(pending_urls):,}")
             return pending_urls
 
     except Exception as e:
@@ -182,11 +272,10 @@ def save_scraped_products_batch(competitor_name, competitor_id, products_list):
     """
     Directly saves a batch of scraped product dictionaries to `competitor_scraped_products`
     and marks their URLs as 'scraped' in `competitor_urls`.
+    Dynamically maps competitor name strictly from the product URL.
     """
     if not products_list:
         return True
-
-    cid = resolve_competitor_id(competitor_name, competitor_id)
 
     conn = None
     try:
@@ -203,6 +292,8 @@ def save_scraped_products_batch(competitor_name, competitor_id, products_list):
                 if not url or not str(url).startswith("http"):
                     continue
                 url = str(url).strip()
+
+                c_name, cid = get_competitor_from_url(url, default_name=competitor_name, default_id=competitor_id)
 
                 name = clean_val(p.get("name") or p.get("Ref Product Name") or p.get("product_name") or p.get("title") or "Product", 512)
                 p_id = clean_val(p.get("product_id") or p.get("Ref Product ID") or p.get("id"), 128)
@@ -224,12 +315,12 @@ def save_scraped_products_batch(competitor_name, competitor_id, products_list):
                 raw_json = json.dumps(p)
 
                 prod_values.append((
-                    competitor_name, cid, url, p_id, v_id,
+                    c_name, cid, url, p_id, v_id,
                     cat, cat_url, brand, name, sku, mpn, gtin,
                     price, image, qty, attr1, attr2, status,
                     raw_json, date_scraped
                 ))
-                url_values.append((competitor_name, cid, url, "scraped", date_scraped))
+                url_values.append((c_name, cid, url, "scraped", date_scraped))
 
             if not prod_values:
                 return True

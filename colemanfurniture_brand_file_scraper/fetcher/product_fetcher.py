@@ -21,10 +21,23 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        target = (url or "").lower()
+        if "homegallery" in target:
+            return "Home Gallery Stores", 15177
+        return "Coleman Furniture", 17028
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        name, _ = get_competitor_from_url(url)
+        return name
 
 try:
     from utils.sitemap_processor import SitemapProcessor
@@ -617,9 +630,8 @@ class ProductFetcher(Spider):
             
         if HAS_DB_QUEUE:
             try:
-                domain_val = getattr(self, "base_domain", "") or getattr(self, "website_url", "")
-                comp_name = "Home Gallery Stores" if "homegallery" in str(domain_val).lower() else "Coleman Furniture"
-                cid = 15177 if comp_name == "Home Gallery Stores" else 17028
+                prod_url = item.get("Ref Product URL") or getattr(self, "base_domain", "") or getattr(self, "website_url", "")
+                comp_name, cid = get_competitor_from_url(prod_url, default_name="Coleman Furniture", default_id=17028)
                 save_scraped_product(comp_name, cid, dict(item))
             except Exception:
                 pass

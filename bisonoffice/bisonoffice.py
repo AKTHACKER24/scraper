@@ -28,10 +28,19 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        return "BisonOffice.com", 17927
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        return "BisonOffice.com"
 
 
 class BisonofficeScraper:
@@ -707,7 +716,8 @@ class BisonofficeScraper:
             writer.writerow(row)
         if HAS_DB_QUEUE:
             try:
-                save_scraped_product("BisonOffice.com", 17927, {
+                comp_name, cid = get_competitor_from_url(row[0], default_name="BisonOffice.com", default_id=17927)
+                save_scraped_product(comp_name, cid, {
                     "url": row[0], "product_id": row[1], "variant_id": row[2],
                     "category": row[3], "category_url": row[4], "brand": row[5],
                     "name": row[6], "sku": row[7], "mpn": row[8], "gtin": row[9],
@@ -811,7 +821,8 @@ class BisonofficeScraper:
                 writer.writerow(row)
             if HAS_DB_QUEUE:
                 try:
-                    save_scraped_product("BisonOffice.com", 17927, {
+                    comp_name, cid = get_competitor_from_url(row[0], default_name="BisonOffice.com", default_id=17927)
+                    save_scraped_product(comp_name, cid, {
                         "url": row[0], "product_id": row[1], "variant_id": row[2],
                         "category": row[3], "category_url": row[4], "brand": row[5],
                         "name": row[6], "sku": row[7], "mpn": row[8], "gtin": row[9],

@@ -32,10 +32,23 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        target = (url or "").lower()
+        if "homegallery" in target:
+            return "Home Gallery Stores", 15177
+        return "Coleman Furniture", 17028
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        name, _ = get_competitor_from_url(url)
+        return name
 
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
@@ -176,8 +189,8 @@ def main():
             return output_file
 
         if HAS_DB_QUEUE:
-            comp_name = "Home Gallery Stores" if "homegallery" in args.website_url.lower() else "Coleman Furniture"
-            cid = 15177 if comp_name == "Home Gallery Stores" else 17028
+            first_url = input_urls[0] if input_urls else args.website_url
+            comp_name, cid = get_competitor_from_url(first_url or args.website_url, default_name="Coleman Furniture", default_id=17028)
             init_c = len(input_urls)
             input_urls = filter_pending_urls(comp_name, input_urls, competitor_id=cid)
             logger.info(f"MySQL DB Queue check: {init_c - len(input_urls):,} URLs already completed in DB. Remaining pending: {len(input_urls):,}")

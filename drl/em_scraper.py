@@ -33,10 +33,19 @@ except Exception:
     HAS_FTP_MANAGER = False
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        return "Emma Mason", 16060
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        return "Emma Mason"
 
 # ================= BYPASS MODULES =================
 
@@ -1040,7 +1049,8 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl
 
         if HAS_DB_QUEUE:
             try:
-                save_scraped_product("Emma Mason", 16060, {
+                comp_name, cid = get_competitor_from_url(row[0], default_name="Emma Mason", default_id=16060)
+                save_scraped_product(comp_name, cid, {
                     "url": row[0], "product_id": row[1], "variant_id": row[2],
                     "category": row[3], "category_url": row[4], "brand": row[5],
                     "name": row[6], "sku": row[7], "mpn": row[8], "gtin": row[9],
@@ -1166,6 +1176,14 @@ def collect_all_sitemap_urls(sitemap: Optional[str] = None, output_file: Optiona
     with open(target_file, "w", encoding="utf-8") as f:
         f.write("\n".join(unique_urls))
     log(f"Saved {len(unique_urls):,} unique product URLs to {target_file}")
+
+    if HAS_DB_QUEUE and unique_urls:
+        try:
+            log(f"Registering {len(unique_urls):,} sitemap URLs into MySQL competitor_urls table...")
+            filter_pending_urls("Emma Mason", unique_urls, competitor_id=16060, mode="full")
+            log(f"✓ Successfully registered all {len(unique_urls):,} URLs in competitor_urls table.")
+        except Exception as ex_db:
+            log(f"⚠ Warning: Could not register URLs to DB: {ex_db}", "WARNING")
 
     return unique_urls
 

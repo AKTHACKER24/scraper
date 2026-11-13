@@ -21,44 +21,31 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_name_from_url,
+        get_competitor_from_url,
+        filter_urls_by_competitor,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_name_from_url(url: str = "") -> str:
+        target = (url or os.getenv("CURR_URL", "https://www.cymax.com")).lower()
+        if "homesquare" in target:
+            return "Homesquare"
+        return "Cymax"
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        c = get_competitor_name_from_url(url)
+        return c, (17442 if c == "Homesquare" else 20612)
+    def filter_urls_by_competitor(urls: list, mode: str = None) -> list:
+        return urls
 
 # ================= ENV =================
 
 CURR_URL = os.getenv("CURR_URL", "https://www.cymax.com").rstrip("/")
-
-def get_competitor_name_from_url(url: str = "") -> str:
-    explicit = os.getenv("COMPETITOR_NAME", "").strip()
-    if explicit:
-        return explicit
-    target = (url or CURR_URL or "").lower()
-    if "homesquare" in target:
-        return "Homesquare"
-    elif "cymax" in target:
-        return "Cymax"
-    netloc = urlparse(target).netloc.replace("www.", "").split(".")[0]
-    return netloc.capitalize() if netloc else "Cymax"
-
-COMPETITOR_NAME = get_competitor_name_from_url(CURR_URL)
-
-def filter_urls_by_competitor(urls: list, mode: str = None) -> list:
-    if not urls:
-        return []
-    if not HAS_DB_QUEUE:
-        return urls
-    by_comp = {}
-    for u in urls:
-        c = get_competitor_name_from_url(u)
-        by_comp.setdefault(c, []).append(u)
-    
-    result = []
-    for c, c_urls in by_comp.items():
-        pending = filter_pending_urls(c, c_urls, mode=mode)
-        result.extend(pending)
-    return result
+COMPETITOR_NAME = os.getenv("COMPETITOR_NAME", "").strip() or get_competitor_name_from_url(CURR_URL)
 SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))

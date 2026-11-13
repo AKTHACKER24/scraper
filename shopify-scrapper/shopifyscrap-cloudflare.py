@@ -20,24 +20,37 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        target = (url or "").lower()
+        if "franceandson" in target:
+            return "France & Son", 16169
+        elif "englishelm" in target:
+            return "English Elm", 20492
+        elif "afastores" in target:
+            return "AFA Stores", 19894
+        elif "graysonliving" in target:
+            return "Grayson Living", 20013
+        return default_name or "Shopify", default_id
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        name, _ = get_competitor_from_url(url, default_name=default)
+        return name
 
 # ================= ENV =================
 
 CURR_URL = os.getenv("CURR_URL", "").rstrip("/")
-COMPETITOR_NAME = os.getenv("COMPETITOR_NAME", "")
-if not COMPETITOR_NAME and CURR_URL:
-    if "franceandson" in CURR_URL.lower():
-        COMPETITOR_NAME = "France & Son"
-    elif "englishelm" in CURR_URL.lower():
-        COMPETITOR_NAME = "English Elm"
-    elif "afastores" in CURR_URL.lower():
-        COMPETITOR_NAME = "AFA Stores"
-    else:
-        COMPETITOR_NAME = CURR_URL.split("//")[-1].replace("www.", "").split(".")[0].title()
+COMPETITOR_NAME, COMPETITOR_ID = get_competitor_from_url(
+    CURR_URL,
+    default_name=os.getenv("COMPETITOR_NAME", "").strip() or None
+)
 
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
@@ -311,15 +324,16 @@ def process_product(url: str, writer, seen: set, crawl_delay=None):
 
         with csv_lock:
             writer.writerow(row)
-        if HAS_DB_QUEUE and COMPETITOR_NAME:
+        if HAS_DB_QUEUE:
             try:
-                save_scraped_product(COMPETITOR_NAME, None, {
-                    "url": row[0], "product_id": row[1], "name": row[2],
-                    "brand": row[3], "category": row[4], "variant_id": row[5],
-                    "sku": row[7], "mpn": row[8], "gtin": row[9],
-                    "price": row[10], "quantity": row[11],
-                    "group_attr_1": row[12], "group_attr_2": row[13],
-                    "status": row[14], "date_scraped": row[15]
+                comp_name, cid = get_competitor_from_url(row[0], default_name=COMPETITOR_NAME, default_id=COMPETITOR_ID)
+                save_scraped_product(comp_name, cid, {
+                    "url": row[0], "product_id": row[1], "variant_id": row[2],
+                    "category": row[3], "category_url": row[4], "brand": row[5],
+                    "name": row[6], "sku": row[7], "mpn": row[8], "gtin": row[9],
+                    "price": row[10], "image": row[11], "quantity": row[12],
+                    "group_attr_1": row[13], "group_attr_2": row[14],
+                    "status": row[15], "date_scraped": row[16]
                 })
             except Exception:
                 pass
@@ -490,7 +504,7 @@ def main():
             log(f"  Found {len(urls)} URLs in sitemap")
             if HAS_DB_QUEUE and COMPETITOR_NAME:
                 init_c = len(urls)
-                urls = filter_pending_urls(COMPETITOR_NAME, urls)
+                urls = filter_pending_urls(COMPETITOR_NAME, urls, competitor_id=COMPETITOR_ID)
                 log(f"  MySQL DB Queue check: {init_c - len(urls):,} URLs already completed in DB. Remaining pending: {len(urls):,}")
             all_product_urls.extend([u for u in urls if u])
             

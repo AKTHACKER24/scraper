@@ -39,10 +39,26 @@ except Exception:
     HAS_FTP_MANAGER = False
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_name_from_url,
+        get_competitor_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        target = (url or "").lower()
+        if "bedroomfurniture" in target:
+            return "Bedroom Furniture Discounts"
+        elif "diningrooms" in target:
+            return "Dining Rooms Outlet"
+        elif "tvstands" in target:
+            return "TV Stands Outlet"
+        return default or "Discount Living Rooms"
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        return get_competitor_name_from_url(url, default_name), default_id
 
 # ================= BYPASS MODULES =================
 
@@ -99,10 +115,10 @@ SITE_SITEMAPS = {
 }
 
 SITE_COMPETITORS = {
-    "discountlivingrooms": "DiscountLivingRooms",
-    "bedroomfurniturediscounts": "Bedroomfurniturediscounts",
-    "diningroomsoutlet": "DiningRoomsOutlet",
-    "tvstandsoutlet": "TvStandsOutlet",
+    "discountlivingrooms": "Discount Living Rooms",
+    "bedroomfurniturediscounts": "Bedroom Furniture Discounts",
+    "diningroomsoutlet": "Dining Rooms Outlet",
+    "tvstandsoutlet": "TV Stands Outlet",
 }
 
 SITE_NAME = os.getenv("SITE_NAME", "").strip().lower()
@@ -110,9 +126,9 @@ if not SITE_NAME:
     parsed_netloc = urlparse(CURR_URL).netloc.replace("www.", "").split(".")[0]
     SITE_NAME = parsed_netloc or "discountlivingrooms"
 
-COMPETITOR_NAME = SITE_COMPETITORS.get(
-    SITE_NAME,
-    normalize_competitor_name(SITE_NAME) if HAS_FTP_MANAGER else SITE_NAME.capitalize()
+COMPETITOR_NAME = os.getenv("COMPETITOR_NAME", "").strip() or get_competitor_name_from_url(
+    CURR_URL,
+    default=SITE_COMPETITORS.get(SITE_NAME, "Discount Living Rooms")
 )
 DATE_DIR = datetime.now(timezone.utc).strftime("%Y%m%d")
 REMOTE_TEMP_DIR = f"{FTP_PATH.rstrip('/')}/{COMPETITOR_NAME}/{DATE_DIR}/output/temp"
@@ -1177,7 +1193,8 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
 
         if HAS_DB_QUEUE:
             try:
-                save_scraped_product(COMPETITOR_NAME, None, {
+                comp = get_competitor_name_from_url(product_url, default=COMPETITOR_NAME)
+                save_scraped_product(comp, None, {
                     "url": product_url,
                     "product_id": product_info.get("product_id"),
                     "name": product_info.get("name"),
@@ -1304,6 +1321,14 @@ def collect_all_sitemap_urls(sitemap: Optional[str] = None, output_file: Optiona
     with open(target_file, "w", encoding="utf-8") as f:
         f.write("\n".join(unique_urls))
     log(f"Saved {len(unique_urls):,} unique product URLs to {target_file}")
+
+    if HAS_DB_QUEUE and unique_urls:
+        try:
+            log(f"Registering {len(unique_urls):,} sitemap URLs into MySQL competitor_urls table...")
+            filter_pending_urls(COMPETITOR_NAME, unique_urls, mode="full")
+            log(f"✓ Successfully registered all {len(unique_urls):,} URLs in competitor_urls table.")
+        except Exception as ex_db:
+            log(f"⚠ Warning: Could not register URLs to DB: {ex_db}", "WARNING")
 
     return unique_urls
 

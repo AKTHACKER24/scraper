@@ -18,14 +18,28 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 try:
-    from db_queue import filter_pending_urls, save_scraped_product
+    from db_queue import (
+        filter_pending_urls,
+        save_scraped_product,
+        get_competitor_from_url,
+        get_competitor_name_from_url,
+    )
     HAS_DB_QUEUE = True
 except Exception:
     HAS_DB_QUEUE = False
+    def get_competitor_from_url(url: str = "", default_name: str = None, default_id: int = None):
+        target = (url or "").lower()
+        if "bedbath" in target:
+            return "Bed Bath & Beyond", 19034
+        return "Overstock", 16167
+    def get_competitor_name_from_url(url: str = "", default: str = None) -> str:
+        name, _ = get_competitor_from_url(url)
+        return name
 
 # ================= ENV =================
 
 CURR_URL = os.getenv("CURR_URL", "").rstrip("/")
+COMPETITOR_NAME, COMPETITOR_ID = get_competitor_from_url(CURR_URL, default_name="Overstock", default_id=16167)
 API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
 BBB_API_BASE_URL = os.getenv("BBB_API_BASE_URL", "").rstrip("/")
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
@@ -696,7 +710,8 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
 
             if HAS_DB_QUEUE:
                 try:
-                    save_scraped_product("Overstock", 16167, {
+                    comp_name, cid = get_competitor_from_url(row[0], default_name=COMPETITOR_NAME, default_id=COMPETITOR_ID)
+                    save_scraped_product(comp_name, cid, {
                         "url": row[0], "product_id": row[1], "variant_id": row[2],
                         "category": row[3], "category_url": row[4], "brand": row[5],
                         "name": row[6], "sku": row[7], "mpn": row[8], "gtin": row[9],
@@ -882,7 +897,7 @@ def main():
 
             if HAS_DB_QUEUE:
                 init_c = len(urls)
-                urls = filter_pending_urls("Overstock", urls, competitor_id=16167)
+                urls = filter_pending_urls(COMPETITOR_NAME, urls, competitor_id=COMPETITOR_ID)
                 log(f"MySQL DB Queue check: {init_c - len(urls):,} URLs already completed in DB. Remaining pending: {len(urls):,}")
                 if not urls:
                     log("All URLs in this sitemap already scraped in database. Skipping.")
